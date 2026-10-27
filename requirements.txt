@@ -1,0 +1,12 @@
+# Python 3.9 - 3.12 (MediaPipe 0.10.21 has no wheels for 3.13+)
+# 0.10.21 is pinned because it still ships the `mediapipe.solutions.hands` API.
+mediapipe==0.10.21
+# mediapipe 0.10.21 needs numpy < 2; OpenCV >= 4.12 needs numpy >= 2.
+# Use the contrib build only: mediapipe depends on it, and installing both
+# opencv-python and opencv-contrib-python makes them overwrite each other.
+numpy>=1.24,<2
+opencv-contrib-python>=4.8,<4.12
+websockets>=13
+
+# UGen300 / Hailo-10H only (not on PyPI): install the HailoRT Python wheel
+# (hailort-*.whl) that matches your driver version from the Hailo Developer Zone.

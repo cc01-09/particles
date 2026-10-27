@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Hailo models (download/compile separately)
+models/*.hef
+
+# OS / editors
+.DS_Store
+Thumbs.db
+*:Zone.Identifier
+.vscode/
+.idea/
