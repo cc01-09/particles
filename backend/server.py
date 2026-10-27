@@ -164,13 +164,24 @@ async def main(args: argparse.Namespace) -> None:
         try:
             await ws.send(json.dumps({"type": "hello", "backend": backend.name,
                                       "backend_label": backend.label}))
-            async for _ in ws:  # we don't expect client messages; just drain
-                pass
+            async for raw in ws:
+                handle_client_message(raw)
         finally:
             clients.discard(ws)
             log.info("client disconnected (%d total)", len(clients))
 
     worker = CaptureWorker(backend, args, publish)
+
+    def handle_client_message(raw) -> None:
+        """Clients may send {"type": "config", "fist_ratio": f, "open_ratio": o}
+        to recalibrate the openness mapping (used by the debug panel)."""
+        try:
+            msg = json.loads(raw)
+            if msg.get("type") == "config":
+                worker.tracker.set_thresholds(float(msg["fist_ratio"]), float(msg["open_ratio"]))
+                log.info("thresholds set to fist=%.3f open=%.3f", *worker.tracker.thresholds)
+        except (ValueError, KeyError, TypeError, AttributeError):
+            log.warning("ignored malformed client message: %.80r", raw)
     stop = asyncio.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:

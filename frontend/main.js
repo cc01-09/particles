@@ -1,25 +1,48 @@
 /**
- * Particles — gesture-controlled 3D particle system (frontend).
+ * Particles — gesture-controlled cosmic particle system (frontend).
  *
  * Data flow:
- *   WebSocket (hand openness, hand count, hand distance @ ~30 Hz)
- *     -> control state (smoothed again at render rate)
- *     -> per-frame CPU update of particle targets (template * scale + spread)
- *     -> custom glow shader with additive blending (GPU)
+ *   WebSocket (per-hand openness + palm center @ ~30 Hz)
+ *     -> control state (smoothed at render rate)
+ *     -> per-particle spring-damper physics on the CPU:
+ *          target = lerp(formed, scattered, openness)      (gather <-> scatter)
+ *     -> GPU shader: curl-noise drift, twinkle, Doppler beaming, glow sprite
+ *     -> bloom post-processing
  *
- * No build step: Three.js is loaded from a CDN through the import map in index.html.
- * URL options:  ?ws=ws://host:8765   ?n=24000 (particle count)
+ * The camera and the particle sizes never change with gestures: a gesture
+ * moves each particle individually.
+ *
+ * No build step: Three.js is loaded from a CDN through the import map.
+ * URL options:  ?ws=ws://host:8765   ?n=32000 (fixed count, disables auto-scaling)
  */
 import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+import { TEMPLATE_DEFS, buildTemplates } from './js/templates.js';
+import { NATURAL, THEMES, cssGradient, paletteFromBase, samplePalette, toColors } from './js/palettes.js';
+import { createSky } from './js/sky.js';
+import { HandSocket } from './js/hands.js';
+import { DebugPanel, loadThresholds } from './js/debug.js';
+import { mulberry32, unitVector } from './js/noise.js';
 
 // ===========================================================================
 // Configuration
 // ===========================================================================
 const params = new URLSearchParams(location.search);
-const PARTICLE_COUNT = clampInt(params.get('n'), 5000, 60000, 24000);
+const MAX_PARTICLES = clampInt(params.get('n'), 4000, 80000, 32000);
+const MIN_PARTICLES = Math.min(8000, MAX_PARTICLES);
+const ADAPTIVE = !params.has('n') && params.get('adaptive') !== '0';
 const WS_URL = params.get('ws') || `ws://${location.hostname || 'localhost'}:8765`;
 
-const BREATH_PHASES = [            // 4-4-6 breathing pattern (seconds)
+const CAMERA_Z = 6.5;
+const FOV = 55;
+const TAN_HALF_FOV = Math.tan(THREE.MathUtils.degToRad(FOV / 2));
+const DAMPING = 0.78;            // spring damping ratio (slightly under-damped)
+
+const BREATH_PHASES = [          // 4-4-6 breathing pattern (seconds)
   { name: 'Inhale', duration: 4 },
   { name: 'Hold', duration: 4 },
   { name: 'Exhale', duration: 6 },
@@ -33,205 +56,190 @@ const BACKEND_LABELS = {
 };
 
 // ===========================================================================
-// Renderer, scene, camera
+// Renderer, camera, post-processing (bloom)
 // ===========================================================================
 const canvas = document.getElementById('scene');
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, powerPreference: 'high-performance' });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.setClearColor(0x000000, 1);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;   // soft highlight roll-off: glow without clipping
+renderer.toneMappingExposure = 1.0;
 
 const scene = new THREE.Scene();
-const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.1, 300);
-camera.position.set(0, 0, 6.5);
+const camera = new THREE.PerspectiveCamera(FOV, window.innerWidth / window.innerHeight, 0.1, 400);
+camera.position.set(0, 0, CAMERA_Z);
+
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+const bloom = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 0.42, 0.45, 0.32);
+composer.addPass(bloom);
+composer.addPass(new OutputPass());
+
+// Background sky (multi-layer stars + Milky Way band, with parallax).
+const sky = createSky(renderer.getPixelRatio());
+scene.add(sky.group);
+
+// Opaque black sphere: the event horizon (Black Hole) or the planet body
+// (Saturn) hides the particles and stars behind it.
+const occluder = new THREE.Mesh(
+  new THREE.SphereGeometry(1, 48, 32),
+  new THREE.MeshBasicMaterial({ color: 0x000000 }),
+);
+occluder.scale.setScalar(0.001);
+scene.add(occluder);
 
 // ===========================================================================
-// Background: faint, slowly rotating starfield
+// Templates and per-particle state
 // ===========================================================================
-function createStarfield(count = 2000) {
-  const pos = new Float32Array(count * 3);
-  for (let i = 0; i < count; i++) {
-    const r = 50 + Math.random() * 60;
-    const [x, y, z] = randomUnitVector();
-    pos.set([x * r, y * r, z * r], i * 3);
-  }
-  const geo = new THREE.BufferGeometry();
-  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-  const mat = new THREE.PointsMaterial({
-    color: 0xffffff, size: 0.16, sizeAttenuation: true,
-    transparent: true, opacity: 0.35, depthWrite: false,
-  });
-  return new THREE.Points(geo, mat);
-}
-const stars = createStarfield();
-scene.add(stars);
+const TEMPLATES = buildTemplates(MAX_PARTICLES);
+const N = MAX_PARTICLES;
+let activeCount = N;
 
-// ===========================================================================
-// Shape templates — each returns N target positions (x, y, z)
-// ===========================================================================
-
-/** 3D "puffy" heart: classic parametric outline, inflated along z. */
-function makeHeart(n) {
-  const out = new Float32Array(n * 3);
-  for (let i = 0; i < n; i++) {
-    const t = Math.random() * Math.PI * 2;
-    const s = Math.sqrt(Math.random());           // uniform over the 2D area
-    const x = 16 * Math.sin(t) ** 3;
-    const y = 13 * Math.cos(t) - 5 * Math.cos(2 * t) - 2 * Math.cos(3 * t) - Math.cos(4 * t);
-    const depth = 0.55 * Math.sqrt(Math.max(0, 1 - s * s));  // thick center, thin edge
-    // 75% on the surface (crisp shape), 25% inside the volume (soft glow).
-    const z = Math.random() < 0.75
-      ? (Math.random() < 0.5 ? -1 : 1) * depth + gauss() * 0.02
-      : (Math.random() * 2 - 1) * depth;
-    out[i * 3] = (x * s / 17) * 1.7;
-    out[i * 3 + 1] = ((y * s + 2.5) / 17) * 1.7;
-    out[i * 3 + 2] = z;
-  }
-  return out;
-}
-
-/** Flower: two layers of cupped petals, a seed head, a stem and a leaf. */
-function makeFlower(n) {
-  const out = new Float32Array(n * 3);
-  const headY = 0.75;
-  const petal = (R, k, rot, cup) => {
-    const th = Math.random() * Math.PI * 2;
-    const env = Math.sqrt(Math.abs(Math.cos((k / 2) * (th + rot))));  // k rounded petals
-    const r = R * env * Math.sqrt(Math.random());
-    const rr = r / R;
-    return [r * Math.cos(th), headY + r * Math.sin(th), cup * rr * rr + gauss() * 0.025];
-  };
-  for (let i = 0; i < n; i++) {
-    const pick = Math.random();
-    let p;
-    if (pick < 0.42) {
-      p = petal(1.45, 5, 0, 0.45);                       // outer petals
-    } else if (pick < 0.66) {
-      p = petal(0.9, 5, Math.PI / 5, 0.7);               // inner petals, offset
-      p[2] += 0.05;
-    } else if (pick < 0.76) {
-      const [x, y, z] = randomUnitVector();              // seed head (dome)
-      p = [x * 0.22, headY + y * 0.22, Math.abs(z) * 0.18 + 0.12];
-    } else if (pick < 0.92) {
-      const u = Math.random();                           // stem
-      p = [0.18 * Math.sin(u * 2.4) + gauss() * 0.025, headY - 0.15 - u * 2.55, -0.1 + gauss() * 0.025];
-    } else {
-      const l = Math.random();                           // leaf on the stem
-      const w = Math.sin(Math.PI * l) * 0.24 * (Math.random() * 2 - 1);
-      const a = 0.6;
-      const bx = 0.18 * Math.sin(0.55 * 2.4), by = headY - 0.15 - 0.55 * 2.55;
-      p = [bx + l * 0.9 * Math.cos(a) - w * Math.sin(a), by + l * 0.9 * Math.sin(a) + w * Math.cos(a), -0.1 + gauss() * 0.02];
-    }
-    out[i * 3] = p[0] * 0.92;
-    out[i * 3 + 1] = (p[1] + 0.35) * 0.92;
-    out[i * 3 + 2] = p[2] * 0.92;
-  }
-  return out;
-}
-
-/** Saturn: a planet sphere plus a tilted ring with a Cassini-like gap. */
-function makeSaturn(n) {
-  const out = new Float32Array(n * 3);
-  const tiltX = 0.42, tiltZ = -0.28;
-  const cx = Math.cos(tiltX), sx = Math.sin(tiltX), cz = Math.cos(tiltZ), sz = Math.sin(tiltZ);
-  for (let i = 0; i < n; i++) {
-    let x, y, z;
-    if (Math.random() < 0.55) {
-      const [ux, uy, uz] = randomUnitVector();
-      const r = 0.85 * (Math.random() < 0.85 ? 1 - Math.random() * 0.03 : Math.cbrt(Math.random()));
-      x = ux * r; y = uy * r; z = uz * r;
-    } else {
-      let r = 1.2 + Math.sqrt(Math.random()) * 0.85;
-      if (r > 1.6 && r < 1.68) r += 0.08;                  // ring gap
-      const th = Math.random() * Math.PI * 2;
-      x = r * Math.cos(th); y = gauss() * 0.012; z = r * Math.sin(th);
-    }
-    // Tilt the whole planet (rotate around X, then Z) so the ring reads in 3D.
-    const y1 = y * cx - z * sx, z1 = y * sx + z * cx;
-    out[i * 3] = x * cz - y1 * sz;
-    out[i * 3 + 1] = x * sz + y1 * cz;
-    out[i * 3 + 2] = z1;
-  }
-  return out;
-}
-
-// Fireworks are animated, so their targets are computed every frame.
-const FIREWORKS = { shells: 7, period: 3.6, launch: 0.18 };
-
-const TEMPLATES = {
-  heart: { positions: makeHeart(PARTICLE_COUNT), followRate: 0.055 },
-  flower: { positions: makeFlower(PARTICLE_COUNT), followRate: 0.055 },
-  saturn: { positions: makeSaturn(PARTICLE_COUNT), followRate: 0.055 },
-  fireworks: { positions: null, followRate: 0.4 },
-};
-
-// ===========================================================================
-// Particle system: BufferGeometry + custom glow shader
-// ===========================================================================
-const N = PARTICLE_COUNT;
-const positions = new Float32Array(N * 3);   // current (rendered) positions
-const colors = new Float32Array(N * 3);      // current colors
+const positions = new Float32Array(N * 3);    // simulated + rendered positions
+const velocities = new Float32Array(N * 3);
+const prevFormed = new Float32Array(N * 3);   // last formed target (feed-forward)
+const colors = new Float32Array(N * 3);
 const targetColors = new Float32Array(N * 3);
-const alphas = new Float32Array(N).fill(1);
 const sizes = new Float32Array(N);
-const seed = new Float32Array(N);            // per-particle random 0..1
-const seed2 = new Float32Array(N);
-const dirs = new Float32Array(N * 3);        // per-particle random unit vector
+const targetSizes = new Float32Array(N);
+const doppler = new Float32Array(N);
+const targetDoppler = new Float32Array(N);
+const seeds = new Float32Array(N);            // 0..1, stagger + twinkle phase
+const mags = new Float32Array(N);             // 0..1 power law: most faint, few bright
+const groups = new Float32Array(N);           // 0 / 1: which hand a stardust grain follows
+const stiffness = new Float32Array(N);        // spring natural frequency (rad/s)
+const scatterDir = new Float32Array(N * 3);   // per-particle random scatter direction
+const scatterDist = new Float32Array(N);
 
-for (let i = 0; i < N; i++) {
-  const [x, y, z] = randomUnitVector();
-  dirs.set([x, y, z], i * 3);
-  const r = 4 + Math.random() * 3;           // start as a loose cloud
-  positions.set([x * r, y * r, z * r], i * 3);
-  seed[i] = Math.random();
-  seed2[i] = Math.random();
-  sizes[i] = 0.5 + Math.random() ** 2 * 1.3; // mostly small, a few bright ones
+{
+  const random = mulberry32(7);
+  for (let i = 0; i < N; i++) {
+    seeds[i] = random();
+    mags[i] = random() ** 5;
+    groups[i] = i % 2;
+    stiffness[i] = 1.6 + random() * 2.6;      // varied -> particles arrive at different times
+    const [x, y, z] = unitVector(random);
+    scatterDir.set([x, y, z], i * 3);
+    scatterDist[i] = 1.2 + 3.2 * random() ** 0.7;
+  }
 }
 
 const geometry = new THREE.BufferGeometry();
 const posAttr = new THREE.BufferAttribute(positions, 3).setUsage(THREE.DynamicDrawUsage);
 const colorAttr = new THREE.BufferAttribute(colors, 3).setUsage(THREE.DynamicDrawUsage);
-const alphaAttr = new THREE.BufferAttribute(alphas, 1).setUsage(THREE.DynamicDrawUsage);
+const sizeAttr = new THREE.BufferAttribute(sizes, 1).setUsage(THREE.DynamicDrawUsage);
+const dopplerAttr = new THREE.BufferAttribute(doppler, 1).setUsage(THREE.DynamicDrawUsage);
 geometry.setAttribute('position', posAttr);
 geometry.setAttribute('aColor', colorAttr);
-geometry.setAttribute('aAlpha', alphaAttr);
-geometry.setAttribute('aSize', new THREE.BufferAttribute(sizes, 1));
-geometry.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 20); // skip per-frame recompute
+geometry.setAttribute('aSize', sizeAttr);
+geometry.setAttribute('aDoppler', dopplerAttr);
+geometry.setAttribute('aSeed', new THREE.BufferAttribute(seeds, 1));
+geometry.setAttribute('aGroup', new THREE.BufferAttribute(groups, 1));
+geometry.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 50);
+
+// GLSL 3D simplex noise (Ian McEwan / Ashima Arts, MIT license).
+const GLSL_NOISE = /* glsl */ `
+  vec3 mod289(vec3 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+  vec4 mod289(vec4 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+  vec4 permute(vec4 x) { return mod289(((x * 34.0) + 10.0) * x); }
+  vec4 taylorInvSqrt(vec4 r) { return 1.79284291400159 - 0.85373472095314 * r; }
+  float snoise(vec3 v) {
+    const vec2 C = vec2(1.0 / 6.0, 1.0 / 3.0);
+    const vec4 D = vec4(0.0, 0.5, 1.0, 2.0);
+    vec3 i = floor(v + dot(v, C.yyy));
+    vec3 x0 = v - i + dot(i, C.xxx);
+    vec3 g = step(x0.yzx, x0.xyz);
+    vec3 l = 1.0 - g;
+    vec3 i1 = min(g.xyz, l.zxy);
+    vec3 i2 = max(g.xyz, l.zxy);
+    vec3 x1 = x0 - i1 + C.xxx;
+    vec3 x2 = x0 - i2 + C.yyy;
+    vec3 x3 = x0 - D.yyy;
+    i = mod289(i);
+    vec4 p = permute(permute(permute(
+      i.z + vec4(0.0, i1.z, i2.z, 1.0)) + i.y + vec4(0.0, i1.y, i2.y, 1.0)) + i.x + vec4(0.0, i1.x, i2.x, 1.0));
+    float n_ = 0.142857142857;
+    vec3 ns = n_ * D.wyz - D.xzx;
+    vec4 j = p - 49.0 * floor(p * ns.z * ns.z);
+    vec4 x_ = floor(j * ns.z);
+    vec4 y_ = floor(j - 7.0 * x_);
+    vec4 x = x_ * ns.x + ns.yyyy;
+    vec4 y = y_ * ns.x + ns.yyyy;
+    vec4 h = 1.0 - abs(x) - abs(y);
+    vec4 b0 = vec4(x.xy, y.xy);
+    vec4 b1 = vec4(x.zw, y.zw);
+    vec4 s0 = floor(b0) * 2.0 + 1.0;
+    vec4 s1 = floor(b1) * 2.0 + 1.0;
+    vec4 sh = -step(h, vec4(0.0));
+    vec4 a0 = b0.xzyw + s0.xzyw * sh.xxyy;
+    vec4 a1 = b1.xzyw + s1.xzyw * sh.zzww;
+    vec3 p0 = vec3(a0.xy, h.x);
+    vec3 p1 = vec3(a0.zw, h.y);
+    vec3 p2 = vec3(a1.xy, h.z);
+    vec3 p3 = vec3(a1.zw, h.w);
+    vec4 norm = taylorInvSqrt(vec4(dot(p0, p0), dot(p1, p1), dot(p2, p2), dot(p3, p3)));
+    p0 *= norm.x; p1 *= norm.y; p2 *= norm.z; p3 *= norm.w;
+    vec4 m = max(0.5 - vec4(dot(x0, x0), dot(x1, x1), dot(x2, x2), dot(x3, x3)), 0.0);
+    m = m * m;
+    return 105.0 * dot(m * m, vec4(dot(p0, x0), dot(p1, x1), dot(p2, x2), dot(p3, x3)));
+  }
+  // Divergence-free flow: cross product of the gradients of two noise fields.
+  vec3 curlNoise(vec3 p) {
+    const float e = 0.12;
+    float a = snoise(p), b = snoise(p + 31.7);
+    vec3 ga = vec3(snoise(p + vec3(e, 0, 0)) - a, snoise(p + vec3(0, e, 0)) - a, snoise(p + vec3(0, 0, e)) - a);
+    vec3 gb = vec3(snoise(p + vec3(31.7 + e, 31.7, 31.7)) - b, snoise(p + vec3(31.7, 31.7 + e, 31.7)) - b,
+                   snoise(p + vec3(31.7, 31.7, 31.7 + e)) - b);
+    return cross(ga, gb) / (e * e);
+  }
+`;
 
 const material = new THREE.ShaderMaterial({
   uniforms: {
-    uSize: { value: 46 },
+    uTime: { value: 0 },
+    uSize: { value: 26 },
     uPixelRatio: { value: renderer.getPixelRatio() },
-    uOpacity: { value: 0.55 },
+    uFlow: { value: 0.18 },          // ambient drift (gas flow, floating dust)
+    uScatter: { value: new THREE.Vector2(1, 1) },  // scatter amount per hand group
+    uScatterNoise: { value: 0.5 },   // extra curl-noise drift while scattered
+    uDoppler: { value: 0 },
+    uOpacity: { value: 0.85 },
   },
   vertexShader: /* glsl */ `
-    uniform float uSize;
-    uniform float uPixelRatio;
+    uniform float uTime, uSize, uPixelRatio, uFlow, uScatterNoise, uDoppler;
+    uniform vec2 uScatter;
     attribute vec3 aColor;
-    attribute float aAlpha;
-    attribute float aSize;
+    attribute float aSize, aSeed, aGroup, aDoppler;
     varying vec3 vColor;
-    varying float vAlpha;
+    ${GLSL_NOISE}
     void main() {
-      vec4 mv = modelViewMatrix * vec4(position, 1.0);
+      vec3 p = position;
+      // Curl-noise drift: gentle when formed, stronger while scattered ("blown stardust").
+      float scatter = mix(uScatter.x, uScatter.y, aGroup);
+      float amp = uFlow + scatter * uScatterNoise;
+      if (amp > 0.002) {
+        p += curlNoise(p * 0.32 + vec3(0.0, 0.0, uTime * 0.04)) * amp * 0.12;
+      }
+      vec4 mv = modelViewMatrix * vec4(p, 1.0);
       gl_Position = projectionMatrix * mv;
-      gl_PointSize = uSize * aSize * uPixelRatio / -mv.z;  // perspective size
-      vColor = aColor;
-      vAlpha = aAlpha;
+      gl_PointSize = uSize * aSize * uPixelRatio / -mv.z;
+
+      // Subtle twinkle, different rate and phase per particle.
+      float twinkle = 1.0 + 0.14 * sin(uTime * (0.7 + aSeed * 2.6) + aSeed * 61.0);
+      // Relativistic beaming: material moving toward us (right side) is brighter.
+      float beam = 1.0 + uDoppler * aDoppler * 0.8 * clamp(p.x / max(length(p.xz), 0.3), -1.0, 1.0);
+      vColor = aColor * twinkle * max(beam, 0.2);
     }
   `,
   fragmentShader: /* glsl */ `
     uniform float uOpacity;
     varying vec3 vColor;
-    varying float vAlpha;
     void main() {
-      // Soft round sprite: bright core + gaussian-like halo.
       float d = length(gl_PointCoord - 0.5) * 2.0;
       if (d > 1.0) discard;
-      float halo = pow(1.0 - d, 2.2);
-      float core = smoothstep(0.35, 0.0, d);
-      float a = (halo * 0.7 + core * 0.5) * vAlpha * uOpacity;
-      gl_FragColor = vec4(vColor * a, a);
+      float a = exp(-d * d * 5.5) + 0.35 * exp(-d * d * 22.0);   // soft halo + core
+      gl_FragColor = vec4(vColor, a * uOpacity);
     }
   `,
   transparent: true,
@@ -240,51 +248,71 @@ const material = new THREE.ShaderMaterial({
 });
 
 const particles = new THREE.Points(geometry, material);
-const group = new THREE.Group();
-group.add(particles);
-scene.add(group);
+particles.frustumCulled = false;
+scene.add(particles);
+
+// ===========================================================================
+// App state
+// ===========================================================================
+const state = {
+  template: 'stardust',
+  theme: 'natural',
+  customColor: document.getElementById('color').value,
+  breathing: false,
+  breathStart: 0,
+  transitionUntil: 0,
+  resetFeedForward: true,
+};
+
+const input = {
+  connected: false,
+  lastMessage: 0,
+  hands: [],            // [{label, openness, ratio, center:[x,y]}] (x mirrored: selfie view)
+  thresholds: null,     // as reported by the server
+};
+
+// Smoothed control signals.
+const ctrl = {
+  presence: 0,          // 0 = no hands, 1 = hands present
+  breathWeight: 0,      // fades the breathing influence in/out
+  scatter: 0,           // template modes: 0 = formed, 1 = scattered
+  groups: [             // Stardust: one dust cloud per hand
+    { x: 0, y: 0, open: 1 },
+    { x: 0, y: 0, open: 1 },
+  ],
+  sway: { x: 0, y: 0 },
+};
 
 // ===========================================================================
 // Colors
 // ===========================================================================
-const state = {
-  template: 'heart',
-  templateSince: 0,
-  baseColor: new THREE.Color(document.getElementById('color').value),
-  colorAnimUntil: 0,
-  breathing: false,
-  breathStart: 0,
-};
+function currentPalette() {
+  if (state.theme === 'custom') return toColors(paletteFromBase(state.customColor));
+  if (state.theme === 'natural') return toColors(NATURAL[state.template]);
+  return toColors(THEMES[state.theme].colors);
+}
 
-/** Compute per-particle target colors from the base color (small hue/lightness jitter). */
-function updateTargetColors(now) {
-  const hsl = { h: 0, s: 0, l: 0 };
-  state.baseColor.getHSL(hsl);
-  const c = new THREE.Color();
-  const fireworks = state.template === 'fireworks';
+/** Recompute per-particle color / size / Doppler targets and start a smooth transition. */
+function updateTargets(now) {
+  const d = TEMPLATES[state.template].data;
+  const palette = currentPalette();
+  const rgb = [0, 0, 0];
   for (let i = 0; i < N; i++) {
-    let h = hsl.h + (seed[i] - 0.5) * 0.06;
-    if (fireworks) h += (i % FIREWORKS.shells) * 0.14;   // each shell its own hue
-    const l = THREE.MathUtils.clamp(hsl.l + (seed2[i] - 0.5) * 0.3, 0.25, 0.85);
-    c.setHSL(((h % 1) + 1) % 1, hsl.s, l);
-    targetColors[i * 3] = c.r;
-    targetColors[i * 3 + 1] = c.g;
-    targetColors[i * 3 + 2] = c.b;
+    samplePalette(palette, d.c[i], rgb);
+    // Brightness follows a power law: most particles faint, a few brilliant.
+    const b = d.b[i] * (0.35 + 1.6 * mags[i]) * 0.75;
+    targetColors[i * 3] = rgb[0] * b;
+    targetColors[i * 3 + 1] = rgb[1] * b;
+    targetColors[i * 3 + 2] = rgb[2] * b;
+    targetSizes[i] = d.size[i] * (0.5 + 2.2 * mags[i]);
+    targetDoppler[i] = d.doppler[i];
   }
-  state.colorAnimUntil = now + 2.5;
+  state.transitionUntil = now + 3;
 }
 
 // ===========================================================================
-// Hand input over WebSocket (auto-reconnect; app stays usable when offline)
+// Hand input
 // ===========================================================================
-const input = {
-  connected: false,
-  lastMessage: 0,
-  numHands: 0,
-  openness: 0,
-  handDistance: null,
-};
-
 const ui = {
   cam: document.getElementById('cam'),
   camPlaceholder: document.getElementById('cam-placeholder'),
@@ -300,63 +328,62 @@ const ui = {
   breathCount: document.getElementById('breath-count'),
 };
 
-function setConnectionState(kind, text) {
-  ui.wsDot.className = `dot ${kind}`;
-  ui.wsState.textContent = text;
-}
+const debugPanel = new DebugPanel(document.getElementById('debug'), (thresholds) => {
+  socket.send({ type: 'config', ...thresholds });
+});
 
-function connect(delay = 500) {
-  setConnectionState('warn', 'Connecting');
-  let ws;
-  try {
-    ws = new WebSocket(WS_URL);
-  } catch (err) {
-    console.warn('WebSocket error', err);
-    setTimeout(() => connect(Math.min(delay * 2, 5000)), delay);
-    return;
-  }
-  ws.onopen = () => {
-    input.connected = true;
-    delay = 500;
-    setConnectionState('ok', 'Connected');
-  };
-  ws.onmessage = (event) => handleMessage(JSON.parse(event.data));
-  ws.onclose = () => {
+const socket = new HandSocket(WS_URL, {
+  onState(kind, text) {
+    ui.wsDot.className = `dot ${kind}`;
+    ui.wsState.textContent = text;
+  },
+  onOpen() {
+    // Re-apply calibration saved in this browser.
+    const saved = loadThresholds();
+    if (saved) socket.send({ type: 'config', ...saved });
+  },
+  onClose() {
     input.connected = false;
-    input.numHands = 0;                    // fall back to idle mode
-    setConnectionState('', 'Offline · retrying');
-    ui.fpsInfer.textContent = '—';
-    ui.hands.textContent = '0';
-    ui.meter.style.width = '0%';
+    input.hands = [];
+    input.thresholds = null;
     ui.cam.style.display = 'none';
     ui.camPlaceholder.style.display = '';
     ui.camPlaceholder.textContent = 'Inference server offline';
-    setTimeout(() => connect(Math.min(delay * 2, 5000)), delay);
-  };
-  ws.onerror = () => ws.close();
-}
+    ui.fpsInfer.textContent = '—';
+    ui.hands.textContent = '0';
+    ui.meter.style.width = '0%';
+  },
+  onMessage(msg) {
+    if (msg.backend) ui.backend.textContent = BACKEND_LABELS[msg.backend] || msg.backend_label || msg.backend;
+    if (msg.type !== 'hands') return;
+    input.connected = true;
+    input.lastMessage = performance.now() / 1000;
+    input.hands = msg.hands || [];
+    input.thresholds = msg.thresholds || null;
 
-function handleMessage(msg) {
-  if (msg.backend) ui.backend.textContent = BACKEND_LABELS[msg.backend] || msg.backend_label || msg.backend;
-  if (msg.type !== 'hands') return;
+    if (msg.image) {
+      ui.cam.src = msg.image;
+      ui.cam.style.display = 'block';
+      ui.camPlaceholder.style.display = 'none';
+    } else {
+      ui.cam.style.display = 'none';
+      ui.camPlaceholder.style.display = '';
+      ui.camPlaceholder.textContent = msg.camera ? 'Preview disabled' : 'No camera detected';
+    }
+    ui.fpsInfer.textContent = `${msg.fps.toFixed(0)} fps · ${msg.infer_ms.toFixed(0)} ms`;
+    ui.hands.textContent = msg.num_hands;
+    ui.meter.style.width = `${(msg.num_hands ? msg.openness : 0) * 100}%`;
+  },
+});
 
-  input.lastMessage = performance.now() / 1000;
-  input.numHands = msg.num_hands;
-  input.openness = msg.openness;
-  input.handDistance = msg.hand_distance;
-
-  if (msg.image) {
-    ui.cam.src = msg.image;
-    ui.cam.style.display = 'block';
-    ui.camPlaceholder.style.display = 'none';
-  } else {
-    ui.cam.style.display = 'none';
-    ui.camPlaceholder.style.display = '';
-    ui.camPlaceholder.textContent = msg.camera ? 'Preview disabled' : 'No camera detected';
-  }
-  ui.fpsInfer.textContent = `${msg.fps.toFixed(0)} fps · ${msg.infer_ms.toFixed(0)} ms`;
-  ui.hands.textContent = msg.num_hands;
-  ui.meter.style.width = `${(msg.num_hands ? msg.openness : 0) * 100}%`;
+/** Palm center (normalized, mirrored) -> world position on the z = 0 plane. */
+function handToWorld(center) {
+  const halfH = CAMERA_Z * TAN_HALF_FOV;
+  const halfW = halfH * camera.aspect;
+  // A little gain so reaching the screen edges doesn't need the frame edges.
+  const u = THREE.MathUtils.clamp((center[0] - 0.5) * 2 * 1.25, -1, 1);
+  const v = THREE.MathUtils.clamp(-(center[1] - 0.5) * 2 * 1.25, -1, 1);
+  return [u * halfW * 0.85, v * halfH * 0.85];
 }
 
 // ===========================================================================
@@ -367,8 +394,7 @@ function breathAt(elapsed) {
   let t = elapsed % BREATH_CYCLE;
   for (const phase of BREATH_PHASES) {
     if (t < phase.duration) {
-      const p = t / phase.duration;
-      const ease = 0.5 - 0.5 * Math.cos(Math.PI * p);
+      const ease = 0.5 - 0.5 * Math.cos((Math.PI * t) / phase.duration);
       const value = phase.name === 'Inhale' ? ease : phase.name === 'Hold' ? 1 : 1 - ease;
       return { value, phase: phase.name, left: Math.ceil(phase.duration - t) };
     }
@@ -387,147 +413,230 @@ function updateBreathUI(b) {
 }
 
 // ===========================================================================
-// Per-frame simulation
+// Control signals (per frame)
 // ===========================================================================
-// Render-side smoothing (backend sends ~30 Hz, we render at 60+ Hz).
-const smooth = { presence: 0, open: 0.45, distFactor: 1, breath: 0 };
-const shellCenters = new Float32Array(FIREWORKS.shells * 3);
-const shellTau = new Float32Array(FIREWORKS.shells);
+const lerpRate = (rate, dt) => 1 - Math.pow(1 - rate, dt * 60);  // frame-rate independent
 
-/** Compute burst center and normalized time (0..1) of each firework shell. */
-function updateFireworkShells(t) {
-  const { shells, period } = FIREWORKS;
-  for (let s = 0; s < shells; s++) {
-    const local = t + (s / shells) * period;
-    const cycle = Math.floor(local / period);
-    shellTau[s] = (local - cycle * period) / period;
-    shellCenters[s * 3] = (hash(s * 17.1 + cycle * 3.7) - 0.5) * 3.4;
-    shellCenters[s * 3 + 1] = 0.35 + (hash(s * 9.3 + cycle * 7.9) - 0.5) * 1.6;
-    shellCenters[s * 3 + 2] = (hash(s * 4.7 + cycle * 1.3) - 0.5) * 1.6;
-  }
-}
-
-/** Firework target for particle i; writes into out[0..2] and returns alpha. */
-function fireworkTarget(i, out) {
-  const s = i % FIREWORKS.shells;
-  const tau = shellTau[s];
-  const cx = shellCenters[s * 3], cy = shellCenters[s * 3 + 1], cz = shellCenters[s * 3 + 2];
-  if (tau < FIREWORKS.launch) {
-    // Rising rocket with a short fading trail.
-    const p = tau / FIREWORKS.launch;
-    const head = -3.4 + (cy + 3.4) * (1 - (1 - p) ** 2);
-    out[0] = cx + gaussFrom(seed2[i]) * 0.02;
-    out[1] = head - seed[i] * 0.7 * p;
-    out[2] = cz;
-    return 0.5 * (1 - seed[i]) * Math.min(1, p * 4);
-  }
-  // Burst: particles fly out radially, slow down, droop with gravity and fade.
-  // Most particles sit on the expanding shell; the rest form streaks behind it.
-  const p = (tau - FIREWORKS.launch) / (1 - FIREWORKS.launch);
-  const streak = seed[i] ** 3 * 0.45;           // 0 = shell front, >0 = trailing
-  const r = 1.3 * (0.92 + 0.08 * seed2[i]) * (1 - Math.exp(-5 * p)) * (1 - streak);
-  out[0] = cx + dirs[i * 3] * r;
-  out[1] = cy + dirs[i * 3 + 1] * r - 0.9 * p * p;
-  out[2] = cz + dirs[i * 3 + 2] * r;
-  return 1.8 * (1 - p) ** 1.6 * (1 - streak * 1.6);  // >1 = extra bright right after the burst
-}
-
-const tmp = new Float32Array(3);
-
-function updateParticles(t, dt) {
-  // ---- 1. Control signals ------------------------------------------------
+function updateControls(t, dt) {
   const live = input.connected && t - input.lastMessage < 1.5;
-  const hands = live ? input.numHands : 0;
-  const k = (rate) => 1 - Math.pow(1 - rate, dt * 60);  // frame-rate independent lerp
+  // Sort by screen x so group 0 = left-most hand, group 1 = right-most hand.
+  const hands = live ? [...input.hands].sort((a, b) => a.center[0] - b.center[0]) : [];
+  ctrl.presence += ((hands.length ? 1 : 0) - ctrl.presence) * lerpRate(0.05, dt);
 
-  smooth.presence += ((hands > 0 ? 1 : 0) - smooth.presence) * k(0.05);
-  smooth.open += ((hands > 0 ? input.openness : 0.45) - smooth.open) * k(0.15);
-  const distTarget = hands === 2 && input.handDistance != null
-    ? THREE.MathUtils.mapLinear(THREE.MathUtils.clamp(input.handDistance, 0.2, 0.9), 0.2, 0.9, 0.85, 1.25)
-    : 1;
-  smooth.distFactor += (distTarget - smooth.distFactor) * k(0.08);
-
-  // Gesture: fist -> gather & shrink (0.55x); open hands -> expand & diffuse (1.35x).
-  // Spread stays moderate so the shape remains readable while it "breathes out".
-  const gestureScale = THREE.MathUtils.lerp(0.55, 1.35, smooth.open) * smooth.distFactor;
-  let scale = THREE.MathUtils.lerp(1, gestureScale, smooth.presence);
-  let spread = smooth.presence * smooth.open ** 2 * 0.22;
-
-  // Breathing mode drives the scale; hands still modulate it gently.
-  const breathTarget = state.breathing ? 1 : 0;
-  smooth.breath += (breathTarget - smooth.breath) * k(0.03);
-  if (smooth.breath > 0.001) {
+  // Breathing: inhale -> scatter, exhale -> gather.
+  ctrl.breathWeight += ((state.breathing ? 1 : 0) - ctrl.breathWeight) * lerpRate(0.03, dt);
+  let breath = 0;
+  if (state.breathing || ctrl.breathWeight > 0.001) {
     const b = breathAt(t - state.breathStart);
+    breath = b.value;
     if (state.breathing) updateBreathUI(b);
-    const handMod = THREE.MathUtils.lerp(1, THREE.MathUtils.lerp(0.85, 1.15, smooth.open), smooth.presence);
-    const breathScale = THREE.MathUtils.lerp(0.72, 1.28, b.value) * handMod;
-    scale = THREE.MathUtils.lerp(scale, breathScale, smooth.breath);
-    spread += smooth.breath * b.value * 0.15;
   }
+  const bw = ctrl.breathWeight;
 
-  // Idle mode (no hands): slow rotation and floating.
-  const idle = 1 - smooth.presence;
-  group.rotation.y += dt * (0.06 + 0.18 * idle);
-  group.rotation.x = Math.sin(t * 0.23) * 0.12 * idle;
-  group.position.y = Math.sin(t * 0.4) * 0.12 * idle;
-  const floatAmp = 0.025 + 0.06 * idle;
-
-  // ---- 2. Particle integration --------------------------------------------
-  const tpl = TEMPLATES[state.template];
-  const fireworks = tpl.positions === null;
-  if (fireworks) updateFireworkShells(t);
-
-  // Ease into a new template's follow rate (fireworks need to be snappy).
-  const sinceSwitch = t - state.templateSince;
-  const rate = THREE.MathUtils.lerp(0.05, tpl.followRate, THREE.MathUtils.clamp(sinceSwitch / 2, 0, 1));
-  const follow = k(rate);
-  const alphaFollow = k(fireworks ? rate : 0.05);
-
-  for (let i = 0; i < N; i++) {
-    const i3 = i * 3;
-    let alpha = 1;
-    if (fireworks) {
-      alpha = fireworkTarget(i, tmp);
-    } else {
-      tmp[0] = tpl.positions[i3];
-      tmp[1] = tpl.positions[i3 + 1];
-      tmp[2] = tpl.positions[i3 + 2];
+  // --- Stardust: each group follows one hand ---------------------------------
+  ctrl.groups.forEach((g, idx) => {
+    const hand = hands.length === 2 ? hands[idx] : hands[0];
+    let targetOpen = 1;                         // no hand: dust fills the screen
+    if (hand) {
+      const [x, y] = handToWorld(hand.center);
+      const f = lerpRate(0.25, dt);             // light smoothing; springs add the drag
+      g.x += (x - g.x) * f;
+      g.y += (y - g.y) * f;
+      targetOpen = hand.openness;
+    } else if (bw > 0.01) {
+      const f = lerpRate(0.03, dt);             // breathing without hands: gather at center
+      g.x -= g.x * f;
+      g.y -= g.y * f;
     }
-    // target = template * scale + random outward spread + gentle floating
-    const sp = spread * (0.3 + seed[i]);
-    const ph = seed2[i] * 6.2832;
-    const tx = tmp[0] * scale + dirs[i3] * sp + Math.sin(t * 0.7 + ph) * floatAmp;
-    const ty = tmp[1] * scale + dirs[i3 + 1] * sp + Math.cos(t * 0.6 + ph * 1.3) * floatAmp;
-    const tz = tmp[2] * scale + dirs[i3 + 2] * sp + Math.sin(t * 0.5 + ph * 0.7) * floatAmp;
+    targetOpen = THREE.MathUtils.lerp(targetOpen, 0.08 + 0.82 * breath, bw);
+    g.open += (targetOpen - g.open) * lerpRate(0.08, dt);
+  });
 
-    positions[i3] += (tx - positions[i3]) * follow;
-    positions[i3 + 1] += (ty - positions[i3 + 1]) * follow;
-    positions[i3 + 2] += (tz - positions[i3 + 2]) * follow;
-    alphas[i] += (alpha - alphas[i]) * alphaFollow;
+  // --- Celestial templates: hands scatter / re-form the object ---------------
+  let scatterTarget = hands.length ? hands.reduce((s, h) => s + h.openness, 0) / hands.length : 0;
+  scatterTarget = THREE.MathUtils.lerp(scatterTarget, 0.35 * breath, bw);
+  ctrl.scatter += (scatterTarget - ctrl.scatter) * lerpRate(0.08, dt);
+
+  // Background parallax: slow drift plus a hint of the hands' average position.
+  let hx = 0;
+  let hy = 0;
+  if (hands.length) {
+    hands.forEach((h) => { hx += h.center[0] - 0.5; hy += h.center[1] - 0.5; });
+    hx /= hands.length; hy /= hands.length;
+  }
+  const sx = Math.sin(t * 0.05) * 0.25 + hx * 0.6 * ctrl.presence;
+  const sy = Math.cos(t * 0.037) * 0.15 - hy * 0.4 * ctrl.presence;
+  ctrl.sway.x += (sx - ctrl.sway.x) * lerpRate(0.02, dt);
+  ctrl.sway.y += (sy - ctrl.sway.y) * lerpRate(0.02, dt);
+}
+
+// ===========================================================================
+// Particle physics (per frame, CPU)
+// ===========================================================================
+/** Per-particle staggered response: some grains react earlier than others. */
+function stagger(o, seed) {
+  const x = Math.min(Math.max((o - seed * 0.3) / 0.7, 0), 1);
+  return x * x * (3 - 2 * x);
+}
+
+function simulate(t, dt) {
+  const tpl = TEMPLATES[state.template];
+  const d = tpl.data;
+  const m = d.tilt;
+  const stardust = state.template === 'stardust';
+  const aspect = camera.aspect;
+  const [g0, g1] = ctrl.groups;
+  const resetFF = state.resetFeedForward;
+  state.resetFeedForward = false;
+  const invDt = 1 / dt;
+
+  for (let i = 0; i < activeCount; i++) {
+    const i3 = i * 3;
+    let fx, fy, fz;     // formed position
+    let sx, sy, sz;     // scattered position
+    let o;              // 0 = formed, 1 = scattered
+
+    if (stardust) {
+      // Formed = dense cloud around the hand; scattered = spread over the screen.
+      const g = groups[i] < 0.5 ? g0 : g1;
+      fx = g.x + d.pos[i3];
+      fy = g.y + d.pos[i3 + 1];
+      fz = d.pos[i3 + 2];
+      const z = d.screen[i3 + 2];
+      const halfH = (CAMERA_Z - z) * TAN_HALF_FOV * 1.04;
+      const ph = seeds[i] * 40;
+      sx = (d.screen[i3] + 0.05 * Math.sin(t * 0.07 + ph)) * halfH * aspect;
+      sy = (d.screen[i3 + 1] + 0.05 * Math.cos(t * 0.06 + ph)) * halfH;
+      sz = z;
+      o = stagger(g.open, seeds[i]);
+    } else {
+      // Formed = template point, spun around its local axis, then tilted.
+      let lx = d.pos[i3];
+      const ly = d.pos[i3 + 1];
+      let lz = d.pos[i3 + 2];
+      const w = d.omega[i];
+      if (w !== 0) {
+        const c = Math.cos(w * t);
+        const s = Math.sin(w * t);
+        const x = lx * c - lz * s;
+        lz = lx * s + lz * c;
+        lx = x;
+      }
+      if (d.fixed[i]) {
+        fx = lx; fy = ly; fz = lz;
+      } else {
+        fx = m[0] * lx + m[1] * ly + m[2] * lz;
+        fy = m[3] * lx + m[4] * ly + m[5] * lz;
+        fz = m[6] * lx + m[7] * ly + m[8] * lz;
+      }
+      // Scattered = blown away along a personal random direction.
+      const dist = scatterDist[i];
+      sx = fx + scatterDir[i3] * dist;
+      sy = fy + scatterDir[i3 + 1] * dist;
+      sz = fz + scatterDir[i3 + 2] * dist;
+      o = stagger(ctrl.scatter, seeds[i]);
+    }
+
+    const tx = fx + (sx - fx) * o;
+    const ty = fy + (sy - fy) * o;
+    const tz = fz + (sz - fz) * o;
+
+    // Feed-forward: velocity of the formed shape itself (rotation), so that
+    // spinning disks are tracked exactly. Stardust keeps the lag on purpose
+    // (the dust "drags" behind the hand).
+    let vfx = 0, vfy = 0, vfz = 0;
+    if (!stardust && !resetFF) {
+      vfx = (fx - prevFormed[i3]) * invDt;
+      vfy = (fy - prevFormed[i3 + 1]) * invDt;
+      vfz = (fz - prevFormed[i3 + 2]) * invDt;
+    }
+    prevFormed[i3] = fx;
+    prevFormed[i3 + 1] = fy;
+    prevFormed[i3 + 2] = fz;
+
+    // Spring-damper: a = w^2 (target - p) - 2 zeta w (v - v_target)
+    const w = stiffness[i];
+    const k = w * w;
+    const c = 2 * DAMPING * w;
+    let vx = velocities[i3];
+    let vy = velocities[i3 + 1];
+    let vz = velocities[i3 + 2];
+    vx += (k * (tx - positions[i3]) - c * (vx - vfx)) * dt;
+    vy += (k * (ty - positions[i3 + 1]) - c * (vy - vfy)) * dt;
+    vz += (k * (tz - positions[i3 + 2]) - c * (vz - vfz)) * dt;
+    velocities[i3] = vx;
+    velocities[i3 + 1] = vy;
+    velocities[i3 + 2] = vz;
+    positions[i3] += vx * dt;
+    positions[i3 + 1] += vy * dt;
+    positions[i3 + 2] += vz * dt;
   }
   posAttr.needsUpdate = true;
-  alphaAttr.needsUpdate = true;
 
-  // ---- 3. Color transitions (only while animating) ------------------------
-  if (t < state.colorAnimUntil) {
-    const cf = k(0.06);
-    for (let i = 0; i < N * 3; i++) colors[i] += (targetColors[i] - colors[i]) * cf;
+  // Smooth color / size transitions after a template or theme change.
+  if (t < state.transitionUntil) {
+    const f = lerpRate(0.045, dt);
+    for (let i = 0; i < N * 3; i++) colors[i] += (targetColors[i] - colors[i]) * f;
+    for (let i = 0; i < N; i++) {
+      sizes[i] += (targetSizes[i] - sizes[i]) * f;
+      doppler[i] += (targetDoppler[i] - doppler[i]) * f;
+    }
     colorAttr.needsUpdate = true;
+    sizeAttr.needsUpdate = true;
+    dopplerAttr.needsUpdate = true;
   }
+
+  // Per-template uniforms (eased).
+  const u = material.uniforms;
+  const e = lerpRate(0.04, dt);
+  u.uFlow.value += (tpl.flow - u.uFlow.value) * e;
+  u.uDoppler.value += (tpl.doppler - u.uDoppler.value) * e;
+  if (stardust) u.uScatter.value.set(g0.open, g1.open);
+  else u.uScatter.value.set(ctrl.scatter, ctrl.scatter);
+  const occ = occluder.scale.x + (Math.max(tpl.occluder, 0.001) - occluder.scale.x) * lerpRate(0.05, dt);
+  occluder.scale.setScalar(occ);
 }
 
 // ===========================================================================
 // UI wiring
 // ===========================================================================
 const templateButtons = [...document.querySelectorAll('[data-template]')];
+const themeRow = document.getElementById('theme-row');
+const customTheme = document.getElementById('custom-theme');
 
-function setTemplate(name) {
-  if (!TEMPLATES[name] || name === state.template) return;
-  const wasFireworks = state.template === 'fireworks';
-  state.template = name;
-  state.templateSince = clock.getElapsedTime();
-  templateButtons.forEach((b) => b.classList.toggle('active', b.dataset.template === name));
-  if (wasFireworks || name === 'fireworks') updateTargetColors(state.templateSince);
+// Theme chips (inserted before the custom color picker).
+const themeButtons = Object.entries(THEMES).map(([key, theme]) => {
+  const btn = document.createElement('button');
+  btn.className = 'theme';
+  btn.dataset.theme = key;
+  btn.title = `${theme.label} theme`;
+  const swatch = document.createElement('span');
+  swatch.className = 'swatch';
+  swatch.style.background = cssGradient(theme.colors || NATURAL.galaxy);
+  const label = document.createElement('span');
+  label.className = 'label-text';
+  label.textContent = theme.label;
+  btn.append(swatch, label);
+  btn.addEventListener('click', () => setTheme(key));
+  themeRow.insertBefore(btn, customTheme);
+  return btn;
+});
+
+function setTemplate(key) {
+  if (!TEMPLATES[key]) return;
+  if (key !== state.template) {
+    state.template = key;
+    state.resetFeedForward = true;
+    updateTargets(clock.getElapsedTime());
+  }
+  templateButtons.forEach((b) => b.classList.toggle('active', b.dataset.template === key));
+}
+
+function setTheme(key) {
+  state.theme = key;
+  themeButtons.forEach((b) => b.classList.toggle('active', b.dataset.theme === key));
+  customTheme.classList.toggle('active', key === 'custom');
+  updateTargets(clock.getElapsedTime());
 }
 
 function setBreathing(on) {
@@ -542,6 +651,10 @@ function setBreathing(on) {
   btn.setAttribute('aria-pressed', String(on));
 }
 
+function setCollapsed(on) {
+  document.body.classList.toggle('collapsed', on);
+}
+
 function toggleFullscreen() {
   if (document.fullscreenElement) document.exitFullscreen();
   else document.documentElement.requestFullscreen?.().catch(() => {});
@@ -549,88 +662,155 @@ function toggleFullscreen() {
 
 templateButtons.forEach((b) => b.addEventListener('click', () => setTemplate(b.dataset.template)));
 document.getElementById('color').addEventListener('input', (e) => {
-  state.baseColor.set(e.target.value);
-  updateTargetColors(clock.getElapsedTime());
+  state.customColor = e.target.value;
+  setTheme('custom');
 });
 document.getElementById('breath-toggle').addEventListener('click', () => setBreathing(!state.breathing));
 document.getElementById('fullscreen').addEventListener('click', toggleFullscreen);
+document.getElementById('collapse').addEventListener('click', () => setCollapsed(true));
+document.getElementById('expand').addEventListener('click', () => setCollapsed(false));
 document.addEventListener('fullscreenchange', () => {
   document.getElementById('fullscreen').textContent = document.fullscreenElement ? 'Exit' : 'Fullscreen';
 });
+
 window.addEventListener('keydown', (e) => {
-  if (e.target instanceof HTMLInputElement) return;
-  const names = ['heart', 'flower', 'saturn', 'fireworks'];
-  if (e.key >= '1' && e.key <= '4') setTemplate(names[Number(e.key) - 1]);
-  else if (e.key === 'b' || e.key === 'B') setBreathing(!state.breathing);
-  else if (e.key === 'f' || e.key === 'F') toggleFullscreen();
+  if (e.target instanceof HTMLInputElement && e.target.type !== 'range') return;
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  const key = e.key.toLowerCase();
+  if (key >= '1' && key <= String(TEMPLATE_DEFS.length)) setTemplate(TEMPLATE_DEFS[Number(key) - 1].key);
+  else if (key === 't') {
+    const keys = Object.keys(THEMES);
+    setTheme(keys[(keys.indexOf(state.theme) + 1) % keys.length]);
+  } else if (key === 'b') setBreathing(!state.breathing);
+  else if (key === 'f') toggleFullscreen();
+  else if (key === 'h') setCollapsed(!document.body.classList.contains('collapsed'));
+  else if (key === 'd') debugPanel.toggle();
 });
 
-window.addEventListener('resize', () => {
+function onResize() {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
+  composer.setPixelRatio(renderer.getPixelRatio());
+  composer.setSize(window.innerWidth, window.innerHeight);
   material.uniforms.uPixelRatio.value = renderer.getPixelRatio();
-});
+  sky.material.uniforms.uPixelRatio.value = renderer.getPixelRatio();
+}
+window.addEventListener('resize', onResize);
+
+// ===========================================================================
+// Adaptive quality: scale the particle count to hold ~60 fps
+// ===========================================================================
+const perf = { frames: 0, time: 0, fps: 60, warmup: 3, goodWindows: 0 };
+
+function adaptQuality(dt) {
+  perf.frames++;
+  perf.time += dt;
+  if (perf.time < 1) return;
+  perf.fps = perf.frames / perf.time;
+  perf.frames = 0;
+  perf.time = 0;
+  ui.fpsRender.textContent = `${Math.round(perf.fps)} fps`;
+  if (!ADAPTIVE || (perf.warmup -= 1) > 0) return;
+
+  if (perf.fps < 48 && activeCount > MIN_PARTICLES) {
+    activeCount = Math.max(MIN_PARTICLES, Math.floor(activeCount * 0.8));
+    perf.goodWindows = 0;
+  } else if (perf.fps > 58 && activeCount < N) {
+    // Grow back slowly, only after sustained headroom.
+    if (++perf.goodWindows >= 3) {
+      activeCount = Math.min(N, Math.floor(activeCount * 1.1));
+      perf.goodWindows = 0;
+    }
+  } else {
+    perf.goodWindows = 0;
+  }
+  geometry.setDrawRange(0, activeCount);
+}
 
 // ===========================================================================
 // Main loop
 // ===========================================================================
 const clock = new THREE.Clock();
-let fpsFrames = 0;
-let fpsTime = 0;
+let debugTimer = 0;
 
 function animate() {
-  const dt = Math.min(clock.getDelta(), 0.1);  // clamp after tab switches
+  const dt = Math.min(clock.getDelta(), 0.05);   // clamp after tab switches
   const t = clock.getElapsedTime();
 
-  updateParticles(t, dt);
-  stars.rotation.y += dt * 0.004;
-  renderer.render(scene, camera);
+  updateControls(t, dt);
+  simulate(t, Math.max(dt, 1e-3));
+  material.uniforms.uTime.value = t;
+  sky.update(t, ctrl.sway);
+  composer.render();
 
-  fpsFrames++;
-  fpsTime += dt;
-  if (fpsTime >= 0.5) {
-    ui.fpsRender.textContent = `${Math.round(fpsFrames / fpsTime)} fps`;
-    fpsFrames = 0;
-    fpsTime = 0;
+  adaptQuality(dt);
+  if ((debugTimer += dt) > 0.2) {
+    debugTimer = 0;
+    debugPanel.update({
+      hands: input.hands,
+      serverThresholds: input.thresholds,
+      stats: `particles ${activeCount.toLocaleString()} / ${N.toLocaleString()} · ${Math.round(perf.fps)} fps · `
+        + `dust ${ctrl.groups[0].open.toFixed(2)} / ${ctrl.groups[1].open.toFixed(2)} · object scatter ${ctrl.scatter.toFixed(2)}`,
+    });
   }
   requestAnimationFrame(animate);
 }
 
-updateTargetColors(0);
+// Start: Stardust spread across the screen, Natural colors.
+{
+  const d = TEMPLATES.stardust.data;
+  for (let i = 0; i < N; i++) {
+    const z = d.screen[i * 3 + 2];
+    const halfH = (CAMERA_Z - z) * TAN_HALF_FOV;
+    positions[i * 3] = d.screen[i * 3] * halfH * camera.aspect;
+    positions[i * 3 + 1] = d.screen[i * 3 + 1] * halfH;
+    positions[i * 3 + 2] = z;
+  }
+}
+setTemplate('stardust');
+setTheme('natural');
 colors.set(targetColors);
-connect();
+sizes.set(targetSizes);
+doppler.set(targetDoppler);
+socket.connect();
 requestAnimationFrame(animate);
 
-// Expose a tiny debug handle (handy for demos and automated checks).
-window.particles = { state, input, smooth, setTemplate, setBreathing, N };
+// Debug / automation handle (used by the headless tests).
+window.particles = {
+  state, input, ctrl, setTemplate, setTheme, setBreathing, setCollapsed,
+  get activeCount() { return activeCount; },
+  /** Mean screen-space x/y (NDC, -1..1) of the particles in a hand group. */
+  centroid(group) {
+    const v = new THREE.Vector3();
+    let sx = 0, sy = 0, n = 0;
+    for (let i = 0; i < activeCount; i++) {
+      if (group != null && groups[i] !== group) continue;
+      v.set(positions[i * 3], positions[i * 3 + 1], positions[i * 3 + 2]).project(camera);
+      sx += v.x; sy += v.y; n++;
+    }
+    return { x: sx / n, y: sy / n };
+  },
+  /** RMS distance of a group's particles from its centroid (world units). */
+  spread(group) {
+    let cx = 0, cy = 0, n = 0;
+    for (let i = 0; i < activeCount; i++) {
+      if (group != null && groups[i] !== group) continue;
+      cx += positions[i * 3]; cy += positions[i * 3 + 1]; n++;
+    }
+    cx /= n; cy /= n;
+    let s = 0;
+    for (let i = 0; i < activeCount; i++) {
+      if (group != null && groups[i] !== group) continue;
+      s += (positions[i * 3] - cx) ** 2 + (positions[i * 3 + 1] - cy) ** 2;
+    }
+    return Math.sqrt(s / n);
+  },
+};
 
 // ===========================================================================
 // Helpers
 // ===========================================================================
-function randomUnitVector() {
-  const u = Math.random() * 2 - 1;
-  const th = Math.random() * Math.PI * 2;
-  const r = Math.sqrt(1 - u * u);
-  return [r * Math.cos(th), r * Math.sin(th), u];
-}
-
-/** Approximate standard normal sample (sum of uniforms). */
-function gauss() {
-  return (Math.random() + Math.random() + Math.random() - 1.5) * 1.15;
-}
-
-/** Deterministic pseudo-normal from a uniform seed (no allocation per frame). */
-function gaussFrom(u) {
-  return (u - 0.5) * 2.3;
-}
-
-/** Cheap deterministic hash -> [0, 1). */
-function hash(x) {
-  const s = Math.sin(x * 127.1 + 311.7) * 43758.5453;
-  return s - Math.floor(s);
-}
-
 function clampInt(value, min, max, fallback) {
   const n = parseInt(value, 10);
   return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;

@@ -1,10 +1,18 @@
 # Particles
 
-**A real-time, gesture-controlled 3D particle system for calm and focus.**
-Open your hands and a glowing heart, flower, planet or firework expands and drifts apart. Close them into a fist and it gathers back together. A built-in breathing guide (4-4-6) turns the particles into a visual pacer for slow breathing.
+**A real-time, gesture-controlled cosmic particle system for calm and focus.**
+Tens of thousands of glowing particles form stardust, a spiral galaxy, Saturn, a nebula, a black hole or a globular star cluster. Open your hand and the particles are blown apart like stardust. Close it into a fist and they drift back together. A built-in breathing guide (4-4-6) turns the gather/scatter rhythm into a visual pacer for slow breathing.
 
 > ASUS UGen AI League hackathon prototype · Theme: **Creator AI** · Track: **Battlefield Lightning**
 > Target hardware: **ASUS UGen300 (Hailo-10H NPU)**
+
+![Stardust gathering around one hand and scattering from the other](docs/stardust.jpg)
+
+| Spiral Galaxy | Black Hole |
+|---|---|
+| ![Spiral galaxy with blue star-forming arms and a warm bulge](docs/galaxy.jpg) | ![Black hole with photon ring, lensed far-side arc and Doppler-brightened disk](docs/blackhole.jpg) |
+
+<sub>Screenshots: `--backend mock` (synthetic hands), captured in headless Chromium with a software renderer. The FPS shown is that renderer's, not a GPU's.</sub>
 
 ---
 
@@ -16,19 +24,52 @@ Particles needs only a webcam. Hand pose estimation runs **locally** (CPU today,
 
 ## Features
 
-- **Real-time hand tracking**: 21 keypoints per hand, up to two hands, at about 30 Hz
-- **Gesture → particle mapping**
-  - Open hands → particles **expand and diffuse**
-  - Fist → particles **gather and shrink**
-  - Two hands: the **distance between them** scales the shape further
-  - Works with **one hand** too
-- **24,000 particles** (adjustable with `?n=`) with a soft additive glow shader
-- **Smooth morphing** between templates: 3D Heart · Flower · Saturn · Fireworks (periodic bursts)
-- **Idle mode**: with no hands detected, particles slowly rotate and float
-- **Breathing guide**: inhale 4 s, hold 4 s, exhale 6 s, with a faint *Inhale / Hold / Exhale* cue
-- **Minimal UI**: template buttons, color picker, breathing toggle, fullscreen, camera preview with skeleton, FPS, active backend (CPU / UGen300) and connection status
-- **Resilient**: the WebSocket reconnects automatically, and the frontend keeps running in idle mode while the backend is offline
-- **Jitter-free**: EMA smoothing on the backend plus frame-rate-independent interpolation on the frontend
+- **Real-time hand tracking**: 21 keypoints per hand, up to two hands, at about 30 Hz, mirrored like a selfie view
+- **Gather ↔ scatter, not zoom**: the camera and particle sizes never change. Gestures move *each particle* individually:
+  - Open hand → every particle drifts away along its own random direction, carried by **curl noise**, at slightly different speeds
+  - Fist → particles return through **spring-damper physics**, each arriving at a slightly different time
+  - Continuous: the amount of scatter follows openness smoothly, not just two states
+- **Stardust mode** (default): ivory/silver dust fills the screen. A detected hand pulls it into a cloud that **follows the palm** with a dragging delay. With two hands, the dust splits into two clouds.
+- **5 realistic celestial templates** that smoothly morph into each other: Spiral Galaxy · Saturn · Nebula · Black Hole · Star Cluster
+- **Realistic rendering**: power-law sizes and brightness (most faint, a few brilliant), additive blending + **UnrealBloom**, ACES tone mapping, subtle twinkle, rotating disks, drifting gas, a multi-layer **parallax starfield** and a faint **Milky Way** band
+- **Color system**: per-particle palette coloring (warm cores, cool outskirts, dark-red dust), a realistic *Natural* theme, 5 preset themes, and a custom color with an auto-generated palette
+- **Breathing guide**: inhale 4 s, hold 4 s, exhale 6 s. The particles scatter as you inhale and gather as you exhale.
+- **Calibration panel** (`D`): live openness, tip ratio and palm coordinates per hand. Tune `FIST_RATIO` / `OPEN_RATIO` with sliders; the values are sent to the server and saved in the browser.
+- **Adaptive quality**: the particle count scales between 8k and 32k to hold about 60 fps
+- **Minimal UI**: semi-transparent panels with line icons that collapse for full immersion (`H`), plus a camera preview with skeleton, FPS, the active backend (CPU / UGen300) and connection status
+- **Resilient**: the WebSocket reconnects automatically, and the visuals keep running in idle mode while the backend is offline
+
+## Modes
+
+| Mode | Formed | Open hand | Motion |
+|---|---|---|---|
+| **Stardust** | Dense cloud centered on your palm (one cloud per hand) | Dust spreads back over the whole screen | Follows the palm with spring drag; slow floating |
+| **Spiral Galaxy** | 2 logarithmic arms, warm bulge, dark-red dust lanes, blue star clusters, ~33° inclination | Stars blown outward | Slow rigid rotation |
+| **Saturn** | Banded oblate planet with limb darkening, razor-thin C/B/A rings with the Cassini division | Planet and rings scatter | Keplerian ring motion |
+| **Nebula** | 3D fractal-noise gas with filaments, H-alpha red vs OIII teal regions, embedded young stars | Gas dissipates | Curl-noise gas flow |
+| **Black Hole** | Dark shadow, thin photon ring, accretion disk (hotter inside), lensed far-side arcs above and below, Doppler-brightened side | Disk tears apart | Keplerian disk (inner orbits faster) |
+| **Star Cluster** | Globular cluster (Plummer profile): very dense core, sparse halo, red giants, blue stragglers | Stars disperse | Slow rotation |
+
+Celestial objects stay centered; your hands control how much they are scattered or re-formed. With no hands, every template rests in its formed shape and keeps its natural motion.
+
+## Color system
+
+Each particle stores a **palette coordinate** `c ∈ [0, 1]` chosen by its template, based on its physical role:
+
+| `c` | Role | Examples |
+|---|---|---|
+| 0.00 | dust / shadow | galaxy dust lanes |
+| 0.25 | warm / hot | galactic bulge, red giants |
+| 0.50 | bright core | photon ring, hottest inner disk |
+| 0.75 | body | ring material, planet bands |
+| 1.00 | cool / outer | spiral arms, blue clusters |
+
+Every palette has 5 stops in this role order, so any palette can color any template and the gradients stay natural.
+
+- **Natural** (default): Stardust is ivory/silver; each celestial template uses its own palette inspired by true-color astrophotography (for example H-alpha red and OIII teal for the nebula, and white-hot to deep orange for the accretion disk).
+- **Presets**: Stellar White · Nebula Rose · Cosmic Teal · Solar Gold · Deep Violet
+- **Custom**: pick one base color; the app derives a 5-stop palette within about ±20° of hue, varying lightness and saturation.
+- Theme and template changes **cross-fade** colors smoothly.
 
 ## Architecture
 
@@ -40,42 +81,66 @@ flowchart LR
         BK -->|--backend cpu| MP[MediaPipe Hands<br/>CPU]
         BK -->|--backend hailo| HL[hand_landmark_lite.hef<br/>Hailo-10H NPU]
         BK -->|--backend mock| MK[Synthetic hands]
-        MP --> FE[Feature extraction<br/>openness · hand count · distance]
+        MP --> FE[Feature extraction<br/>openness · palm center · ratio]
         HL --> FE
         MK --> FE
         FE --> EMA[EMA smoothing]
         EMA --> WS[(WebSocket server<br/>ws://localhost:8765<br/>~30 Hz JSON + preview JPEG)]
     end
     subgraph Browser["Browser (Three.js, no build step)"]
-        WS --> CTRL[Control state<br/>render-rate smoothing]
-        CTRL --> SIM[Particle simulation<br/>template × scale + spread]
-        BR[Breathing guide 4-4-6] --> SIM
-        SIM --> GPU[Glow shader<br/>additive blending]
-        WS --> HUD[HUD: camera · FPS · backend · status]
+        WS --> CTRL[Control state<br/>per-hand groups · breathing]
+        CTRL --> PHY[CPU physics<br/>spring-damper per particle<br/>target = lerp formed, scattered]
+        TPL[Celestial templates<br/>+ palettes] --> PHY
+        PHY --> GPU[Vertex shader<br/>curl noise · twinkle · Doppler]
+        GPU --> POST[Bloom + ACES tone mapping]
+        WS --> HUD[HUD · calibration panel]
+        HUD -. config: FIST/OPEN_RATIO .-> WS
     end
 ```
+
+### Gather / scatter physics
+
+For every particle, each frame:
+
+```
+formed     F = template point (spun + tilted)    or   palm position + cloud offset  (Stardust)
+scattered  S = F + random_dir · random_dist       or   its own spot on the full screen (Stardust)
+o_i        = smoothstep(stagger(openness, seed_i))    # some grains react earlier
+target     = F + (S − F) · o_i
+accel      = ω_i² (target − p) − 2ζω_i (v − v_F)      # spring-damper, ω_i random per particle
+```
+
+`v_F` (the formed shape's own velocity) is fed forward, so rotating disks are tracked exactly. Stardust leaves it out on purpose to create the dragging delay. The GPU adds divergence-free curl noise whose strength grows with the scatter amount.
 
 ### Openness metric
 
 ```
 palm_size  = |middle_finger_MCP − wrist|
 tip_ratio  = mean(|fingertip_k − wrist|  for k in thumb..pinky) / palm_size
-openness   = clip((tip_ratio − 1.0) / (1.75 − 1.0), 0, 1)       # 0 = fist, 1 = open
+openness   = clip((tip_ratio − FIST_RATIO) / (OPEN_RATIO − FIST_RATIO), 0, 1)   # defaults 1.0 / 1.75
 ```
 
-Dividing by palm size makes the value independent of how far the hand is from the camera. Distances are computed in isotropic pixel space, so the camera aspect ratio doesn't skew them.
+Dividing by palm size makes the value independent of how far the hand is from the camera. Distances are computed in isotropic pixel space, so the camera aspect ratio doesn't skew them. Thresholds can be tuned live in the calibration panel.
 
-### WebSocket message (≈30 Hz)
+### WebSocket protocol
+
+Server → browser (≈30 Hz):
 
 ```json
 {
   "type": "hands", "backend": "cpu", "backend_label": "CPU (MediaPipe)",
   "camera": true, "fps": 29.8, "infer_ms": 9.7,
-  "num_hands": 2, "openness": 0.83, "hand_distance": 0.62,
-  "hands": [{ "label": "Left", "openness": 0.91, "raw_openness": 0.95, "center": [0.31, 0.55], "score": 0.98 }],
+  "num_hands": 1, "openness": 0.83, "hand_distance": null,
+  "hands": [{ "label": "Right", "openness": 0.83, "raw_openness": 0.86, "ratio": 1.62,
+              "center": [0.71, 0.48], "score": 0.98 }],
+  "thresholds": { "fist_ratio": 1.0, "open_ratio": 1.75 },
   "image": "data:image/jpeg;base64,..."
 }
 ```
+
+`center` is the palm center, normalized to [0, 1] in the **mirrored** frame: moving your hand to your right increases `x`.
+
+Browser → server (calibration): `{"type": "config", "fist_ratio": 0.95, "open_ratio": 1.8}`
 
 ### Project layout
 
@@ -85,14 +150,22 @@ particles/
 ├── start.sh / start.bat   # create venv on first run, then run.py
 ├── requirements.txt
 ├── backend/
-│   ├── server.py          # capture loop + WebSocket broadcast
-│   ├── hand_features.py   # openness, distance, EMA, skeleton drawing
+│   ├── server.py          # capture loop + WebSocket broadcast + config messages
+│   ├── hand_features.py   # tip ratio, openness, palm center, EMA, skeleton drawing
 │   ├── backend_cpu.py     # MediaPipe Hands (demo backend)
 │   ├── backend_hailo.py   # UGen300 / Hailo-10H interface prototype (untested)
-│   └── backend_mock.py    # synthetic hands for testing without a camera
+│   └── backend_mock.py    # synthetic moving hands for testing without a camera
 ├── frontend/
 │   ├── index.html         # UI + styles, Three.js via CDN import map
-│   └── main.js            # particles, templates, gestures, breathing, WebSocket
+│   ├── main.js            # renderer, bloom, physics, controls, UI wiring
+│   └── js/
+│       ├── templates.js   # Stardust + 5 celestial point distributions
+│       ├── palettes.js    # Natural / preset / custom palettes
+│       ├── sky.js         # parallax starfield + Milky Way
+│       ├── hands.js       # WebSocket client with auto-reconnect
+│       ├── debug.js       # calibration panel (localStorage)
+│       └── noise.js       # seeded RNG, simplex noise, fBm
+├── docs/                  # README screenshots
 └── models/                # put *.hef files here (git-ignored)
 ```
 
@@ -131,23 +204,45 @@ python run.py                       # CPU / MediaPipe (default)
 | `python run.py --backend hailo --hef models/hand_landmark_lite.hef` | UGen300 prototype (see below) |
 | `python run.py --no-browser` | Don't open a browser |
 | `python run.py --smoothing 0.25` | Extra args are forwarded to `backend/server.py` (lower = smoother) |
-| `http://localhost:8000/?n=40000` | Change the particle count (5k – 60k) |
+| `http://localhost:8000/?n=40000` | Fixed particle count (4k – 80k; disables auto-scaling) |
+| `http://localhost:8000/?adaptive=0` | Keep 32k particles even on slow devices |
 
 > **WSL note:** WSL2 doesn't expose USB webcams by default. Run on native Windows/Linux, attach the camera with [`usbipd`](https://learn.microsoft.com/windows/wsl/connect-usb), or use `--backend mock`.
 
 ## How to use
 
-| Gesture / key | Effect |
-|---|---|
-| ✋ Open hand(s) | Particles expand and diffuse |
-| ✊ Fist | Particles gather and shrink |
-| 🙌 Move two hands apart / together | Shape grows / shrinks further |
-| No hands | Idle: slow rotation and floating |
-| `1` `2` `3` `4` | Heart · Flower · Saturn · Fireworks |
-| `B` | Toggle breathing guide (inhale 4 s · hold 4 s · exhale 6 s) |
-| `F` | Fullscreen |
+### Gestures
 
-**Breathing mode:** the breathing rhythm controls the size of the shape. Your hands still adjust it gently, so you can "hold" the breath with open palms. Follow the shape: breathe in as it grows, hold, and breathe out slowly as it shrinks.
+| Gesture | Stardust | Celestial templates |
+|---|---|---|
+| ✊ Fist | Dust gathers into a dense cloud at your palm (tighter fist = denser) | The object re-forms |
+| ✋ Open hand | Dust is blown back over the whole screen | The object is blown apart |
+| 🤏 Half open | In between: the scatter amount is continuous | In between |
+| ↔ Move your hand | The cloud follows your palm with a dragging delay (mirror view) | — |
+| 🙌 Two hands | Two clouds, one per hand | Average openness of both hands |
+| No hands | Dust fills the screen and floats | Formed object with its natural motion |
+
+**Breathing mode** (`B`): inhale 4 s → the particles scatter; hold 4 s; exhale 6 s → they gather again (in Stardust, around your hand or the screen center). A faint *Inhale / Hold / Exhale* cue and countdown appear in the center.
+
+### Keyboard shortcuts
+
+| Key | Action |
+|---|---|
+| `1` – `6` | Stardust · Spiral Galaxy · Saturn · Nebula · Black Hole · Star Cluster |
+| `T` | Next color theme |
+| `B` | Breathing guide on/off |
+| `F` | Fullscreen |
+| `H` | Hide / show all panels (immersive mode) |
+| `D` | Gesture calibration panel |
+
+### Calibrating gestures
+
+Press `D` and watch the **ratio** of each hand:
+
+1. Make a tight fist and set `FIST_RATIO` slightly **above** the ratio shown.
+2. Spread your hand fully and set `OPEN_RATIO` slightly **below** the ratio shown.
+
+Changes apply immediately on the server and are stored in the browser's `localStorage`, then re-applied on the next connection. *Reset to defaults* restores 1.00 / 1.75.
 
 ## UGen300 deployment (Hailo-10H)
 
@@ -184,10 +279,11 @@ Everything downstream of `process()` is backend-agnostic: feature extraction, sm
 ## Limitations
 
 - The **Hailo backend is untested** on hardware and lacks palm detection and verified post-processing (see above).
-- The openness thresholds (`FIST_RATIO`, `OPEN_RATIO` in `hand_features.py`) are tuned for a frontal camera. Extreme angles (palm edge-on to the camera) reduce accuracy.
+- The default openness thresholds (`FIST_RATIO`, `OPEN_RATIO`) are tuned for a frontal camera; use the calibration panel (`D`) for your setup. Extreme angles (palm edge-on to the camera) reduce accuracy.
 - MediaPipe is pinned to **0.10.21** (the last version with the `solutions` API used here), which limits Python to **≤ 3.12**.
 - Tracking depends on lighting; low light or busy backgrounds increase jitter and missed detections.
-- The particle simulation runs on the CPU in JavaScript (about 24k particles at 60 FPS on a typical laptop). Much larger counts would need a GPU (GPGPU) simulation.
+- The spring physics runs on the CPU in JavaScript; curl noise, twinkle and Doppler run on the GPU. The particle count auto-scales (8k – 32k) to hold about 60 fps. Much larger counts would need a GPGPU simulation.
+- The celestial objects are artistic, physically *inspired* models (log-spiral arms, Plummer profile, Keplerian disks, a lensing approximation), not physical simulations.
 - The frontend loads Three.js from a CDN. For fully offline kiosks, vendor `three.module.js` locally and update the import map.
 - The camera preview is sent as base64 JPEG over a local WebSocket. That is fine on localhost but not designed for remote or multi-user streaming.
 - This is not a medical device. The breathing guide is for relaxation only.

@@ -2,10 +2,14 @@
 Mock backend: synthetic hands, no camera required.
 
 Generates anatomically plausible 21-point hands that open, close and move
-apart over time. Useful for testing the full pipeline (feature extraction,
-WebSocket, renderer) on machines without a webcam, or for rehearsing a demo.
+around the frame over time. Useful for testing the full pipeline (feature
+extraction, WebSocket, renderer) on machines without a webcam, or for
+rehearsing a demo.
 
-Timeline (repeats every 24 s): 0-14 s two hands, 14-20 s one hand, 20-24 s none.
+Timeline (repeats every 30 s):
+   0-12 s  one hand sweeping left <-> right while opening / closing
+  12-24 s  two hands, each drifting on its own side
+  24-30 s  no hands (idle)
 """
 
 from __future__ import annotations
@@ -58,18 +62,23 @@ class MockBackend:
     def process(self, frame_bgr: np.ndarray) -> list[HandResult]:
         h, w = frame_bgr.shape[:2]
         t = time.perf_counter() - self._t0
-        phase = t % 24.0
-        count = 2 if phase < 14 else 1 if phase < 20 else 0
+        phase = t % 30.0
 
-        hands = []
-        separation = 0.22 + 0.12 * math.sin(t * 0.35)
-        for i in range(count):
-            curl = 0.5 + 0.5 * math.sin(t * 0.9 + i * 0.8)
-            side = -1 if i == 0 else 1
-            cx = 0.5 + side * separation if count == 2 else 0.5
-            hands.append(self._place(synthetic_hand(curl), cx, 0.62, 0.16, w, h, mirror=side > 0,
-                                     label="Left" if side < 0 else "Right"))
-        return hands
+        if phase < 12:      # one hand sweeping across the frame
+            curl = 0.5 + 0.5 * math.sin(t * 0.8)
+            cx = 0.5 + 0.3 * math.sin(t * 0.5)
+            cy = 0.55 + 0.08 * math.sin(t * 0.9)
+            return [self._place(synthetic_hand(curl), cx, cy, 0.16, w, h, mirror=True, label="Right")]
+        if phase < 24:      # two hands on either side
+            hands = []
+            for i, side in enumerate((-1, 1)):
+                curl = 0.5 + 0.5 * math.sin(t * 0.9 + i * 1.6)
+                cx = 0.5 + side * (0.24 + 0.08 * math.sin(t * 0.4 + i))
+                cy = 0.55 + 0.1 * math.sin(t * 0.6 + i * 2.0)
+                hands.append(self._place(synthetic_hand(curl), cx, cy, 0.16, w, h, mirror=side > 0,
+                                         label="Left" if side < 0 else "Right"))
+            return hands
+        return []
 
     @staticmethod
     def _place(local: np.ndarray, cx: float, cy: float, scale: float, w: int, h: int,

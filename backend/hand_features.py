@@ -78,10 +78,8 @@ def to_pixels(landmarks: np.ndarray, width: int, height: int) -> np.ndarray:
     return landmarks * np.array([width, height, width], dtype=np.float32)
 
 
-def compute_openness(landmarks: np.ndarray, width: int, height: int) -> float:
-    """How open is the hand? 0.0 = closed fist, 1.0 = fully spread.
-
-    openness = normalize( mean(|fingertip - wrist|) / |middle_mcp - wrist| )
+def tip_ratio(landmarks: np.ndarray, width: int, height: int) -> float:
+    """mean(|fingertip - wrist|) / |middle_mcp - wrist|  (scale invariant).
 
     Dividing by the palm size (wrist -> middle finger knuckle) makes the
     measure invariant to how far the hand is from the camera.
@@ -91,8 +89,17 @@ def compute_openness(landmarks: np.ndarray, width: int, height: int) -> float:
     if palm_size < 1e-6:
         return 0.0
     tip_dist = np.linalg.norm(pts[list(FINGERTIPS)] - pts[WRIST], axis=1).mean()
-    ratio = tip_dist / palm_size
-    return float(np.clip((ratio - FIST_RATIO) / (OPEN_RATIO - FIST_RATIO), 0.0, 1.0))
+    return float(tip_dist / palm_size)
+
+
+def compute_openness(landmarks: np.ndarray, width: int, height: int,
+                     fist_ratio: float = FIST_RATIO, open_ratio: float = OPEN_RATIO) -> float:
+    """How open is the hand? 0.0 = closed fist, 1.0 = fully spread.
+
+    The tip ratio is mapped linearly from [fist_ratio, open_ratio] to [0, 1].
+    """
+    ratio = tip_ratio(landmarks, width, height)
+    return float(np.clip((ratio - fist_ratio) / (open_ratio - fist_ratio), 0.0, 1.0))
 
 
 def palm_center(landmarks: np.ndarray) -> np.ndarray:
@@ -111,10 +118,19 @@ class HandFeatureTracker:
         """
         self.alpha = alpha
         self.lost_timeout = lost_timeout
+        # (fist_ratio, open_ratio); replaced atomically, tunable at runtime
+        # from the frontend debug panel.
+        self.thresholds = (FIST_RATIO, OPEN_RATIO)
         self._openness: dict[str, EMA] = {}
         self._distance = EMA(alpha)
         self._last_hands: list[dict] = []
         self._last_seen = 0.0
+
+    def set_thresholds(self, fist_ratio: float, open_ratio: float) -> None:
+        """Update the openness calibration (validated, open > fist)."""
+        fist_ratio = float(np.clip(fist_ratio, 0.3, 2.5))
+        open_ratio = float(np.clip(open_ratio, fist_ratio + 0.05, 3.0))
+        self.thresholds = (round(fist_ratio, 3), round(open_ratio, 3))
 
     def _assign_keys(self, hands: list[HandResult]) -> list[str]:
         """Stable key per hand. Falls back to left/right screen position if
@@ -141,15 +157,20 @@ class HandFeatureTracker:
 
         hands = sorted(hands, key=lambda h: -h.score)[:2]
         keys = self._assign_keys(hands)
+        fist_ratio, open_ratio = self.thresholds
         out = []
         for key, hand in zip(keys, hands):
-            raw = compute_openness(hand.landmarks, width, height)
+            ratio = tip_ratio(hand.landmarks, width, height)
+            raw = float(np.clip((ratio - fist_ratio) / (open_ratio - fist_ratio), 0.0, 1.0))
             ema = self._openness.setdefault(key, EMA(self.alpha))
             cx, cy = palm_center(hand.landmarks)
             out.append({
                 "label": key,
                 "openness": round(ema.update(raw), 4),
                 "raw_openness": round(raw, 4),
+                "ratio": round(ratio, 3),  # un-normalized tip ratio (for calibration)
+                # Palm center, normalized to [0, 1]. The frame is mirrored
+                # before inference, so x grows towards the user's right.
                 "center": [round(float(cx), 4), round(float(cy), 4)],
                 "score": round(float(hand.score), 3),
             })
@@ -178,6 +199,7 @@ class HandFeatureTracker:
             "hands": hands,
             "openness": round(avg, 4),
             "hand_distance": None if dist is None else round(dist, 4),
+            "thresholds": {"fist_ratio": self.thresholds[0], "open_ratio": self.thresholds[1]},
         }
 
 
