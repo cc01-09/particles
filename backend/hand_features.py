@@ -149,7 +149,7 @@ class HandFeatureTracker:
         if not hands:
             # Hold the last known state briefly to avoid flicker.
             if self._last_hands and now - self._last_seen < self.lost_timeout:
-                return self._summary(self._last_hands)
+                return self._summary(self._last_hands, stale=True)
             self._openness.clear()
             self._distance.reset()
             self._last_hands = []
@@ -191,7 +191,7 @@ class HandFeatureTracker:
         self._last_seen = now
         return self._summary(self._last_hands)
 
-    def _summary(self, hands: list[dict]) -> dict:
+    def _summary(self, hands: list[dict], stale: bool = False) -> dict:
         avg = float(np.mean([h["openness"] for h in hands])) if hands else 0.0
         dist = self._distance.value if len(hands) == 2 else None
         return {
@@ -200,6 +200,9 @@ class HandFeatureTracker:
             "openness": round(avg, 4),
             "hand_distance": None if dist is None else round(dist, 4),
             "thresholds": {"fist_ratio": self.thresholds[0], "open_ratio": self.thresholds[1]},
+            # True while repeating the last detection after a drop-out
+            # (anti-flicker); clients that track motion can ignore it.
+            "stale": stale,
         }
 
 

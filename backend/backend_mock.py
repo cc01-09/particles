@@ -6,10 +6,21 @@ around the frame over time. Useful for testing the full pipeline (feature
 extraction, WebSocket, renderer) on machines without a webcam, or for
 rehearsing a demo.
 
-Timeline (repeats every 30 s):
-   0-12 s  one hand sweeping left <-> right while opening / closing
-  12-24 s  two hands, each drifting on its own side
-  24-30 s  no hands (idle)
+Scenarios (--mock-scenario):
+
+  raise  (26 s cycle) - tests stabilization, exit look-back and hold:
+     0-2    no hand
+     2-3.2  hand rises from below the frame, fingers flapping (should be ignored)
+     3.2-11 hand stays, slowly opening and closing (controls the particles)
+     11-11.4 hand drops quickly out of the frame while opening (should be ignored)
+     11.4-26 no hand (state is held; long idle -> dimming)
+
+  sweep  (30 s cycle) - tests following and two-hand control:
+     0-12   one hand sweeping left <-> right while opening / closing
+     12-24  two hands, each drifting on its own side
+     24-30  no hands
+
+  all    raise followed by sweep (56 s cycle, default)
 """
 
 from __future__ import annotations
@@ -56,13 +67,47 @@ class MockBackend:
     label = "Mock (synthetic)"
     needs_camera = False
 
-    def __init__(self):
+    SCENARIOS = {"raise": 26.0, "sweep": 30.0}
+
+    def __init__(self, scenario: str = "all"):
+        if scenario not in ("all", *self.SCENARIOS):
+            raise ValueError(f"unknown mock scenario: {scenario}")
+        self.scenario = scenario
         self._t0 = time.perf_counter()
 
     def process(self, frame_bgr: np.ndarray) -> list[HandResult]:
         h, w = frame_bgr.shape[:2]
         t = time.perf_counter() - self._t0
-        phase = t % 30.0
+        if self.scenario == "raise":
+            return self._raise(t % self.SCENARIOS["raise"], w, h)
+        if self.scenario == "sweep":
+            return self._sweep(t, t % self.SCENARIOS["sweep"], w, h)
+        cycle = t % (self.SCENARIOS["raise"] + self.SCENARIOS["sweep"])
+        if cycle < self.SCENARIOS["raise"]:
+            return self._raise(cycle, w, h)
+        return self._sweep(t, cycle - self.SCENARIOS["raise"], w, h)
+
+    def _raise(self, phase: float, w: int, h: int) -> list[HandResult]:
+        """Raise a hand into view, use it, then drop it out quickly."""
+        cx = 0.62 + 0.03 * math.sin(phase * 0.5)
+        if phase < 2.0 or phase >= 11.4:
+            return []
+        if phase < 3.2:                          # rising from below, fingers flapping
+            cy = 1.15 - 0.6 * (phase - 2.0) / 1.2    # ~0.5 frame heights / s
+            curl = 0.5 + 0.5 * math.sin(phase * 9.0)
+        elif phase < 11.0:                       # steady, slowly opening / closing
+            cy = 0.55 + 0.015 * math.sin(phase * 0.8)
+            curl = 0.5 + 0.5 * math.cos((phase - 3.2) * 0.8)
+        else:                                    # fast drop while the hand opens
+            k = (phase - 11.0) / 0.4
+            cy = 0.55 + 0.65 * k                   # ~1.6 frame heights / s
+            curl = max(0.0, 1.0 - 2.0 * k)
+        if cy > 0.95:                            # palm center outside the frame: not detected
+            return []
+        return [self._place(synthetic_hand(curl), cx, cy, 0.16, w, h, mirror=True, label="Right")]
+
+    def _sweep(self, t: float, phase: float, w: int, h: int) -> list[HandResult]:
+        """One hand sweeping across the frame, then two hands."""
 
         if phase < 12:      # one hand sweeping across the frame
             curl = 0.5 + 0.5 * math.sin(t * 0.8)

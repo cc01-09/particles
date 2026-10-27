@@ -28,16 +28,20 @@ Particles needs only a webcam. Hand pose estimation runs **locally** (CPU today,
 - **Gather ↔ scatter, not zoom**: the camera and particle sizes never change. Gestures move *each particle* individually:
   - Open hand → every particle drifts away along its own random direction, carried by **curl noise**, at slightly different speeds
   - Fist → particles return through **spring-damper physics**, each arriving at a slightly different time
-  - Continuous: the amount of scatter follows openness smoothly, not just two states
+  - Continuous and linear: a half-open hand gives half the scatter. No thresholds or on/off states.
+  - Speed follows your fingers: close slowly and the particles gather slowly; close fast and they gather faster, up to a calm maximum
+- **Your state is kept**: when your hands leave, the particles stay exactly as you left them, drifting very slightly. When a hand returns, control resumes smoothly from there. `R` / **Reset** returns to the mode's default shape.
+- **Raise and lower your hand freely**: a hand only takes control once it is steady (0.4 s), openness pauses during fast moves, and when a hand is lowered quickly out of view the state is rolled back to just before that motion
+- **Idle dimming**: after 60 s without a hand or a noticeable gesture, the particles fade very slowly to 18% brightness while ~4% stay lit and twinkle like bright stars. A detected hand restores full brightness within 1.5 s. The background sky never dims.
 - **Stardust mode** (default): ivory/silver dust fills the screen. A detected hand pulls it into a cloud that **follows the palm** with a dragging delay. With two hands, the dust splits into two clouds.
 - **5 realistic celestial templates** that smoothly morph into each other: Spiral Galaxy · Saturn · Nebula · Black Hole · Star Cluster
 - **Realistic rendering**: power-law sizes and brightness (most faint, a few brilliant), additive blending + **UnrealBloom**, ACES tone mapping, subtle twinkle, rotating disks, drifting gas, a multi-layer **parallax starfield** and a faint **Milky Way** band
 - **Color system**: per-particle palette coloring (warm cores, cool outskirts, dark-red dust), a realistic *Natural* theme, 5 preset themes, and a custom color with an auto-generated palette
 - **Breathing guide**: inhale 4 s, hold 4 s, exhale 6 s. The particles scatter as you inhale and gather as you exhale.
-- **Calibration panel** (`D`): live openness, tip ratio and palm coordinates per hand. Tune `FIST_RATIO` / `OPEN_RATIO` with sliders; the values are sent to the server and saved in the browser.
+- **Debug panel** (`D`): live per-hand state (*Controlling / Stabilizing*), group state (*Held*), openness, tip ratio, palm coordinates and speed, idle time and brightness. Sliders tune `FIST_RATIO` / `OPEN_RATIO` (sent to the server) and every motion, stability and dimming constant. All values are saved in the browser.
 - **Adaptive quality**: the particle count scales between 8k and 32k to hold about 60 fps
 - **Minimal UI**: semi-transparent panels with line icons that collapse for full immersion (`H`), plus a camera preview with skeleton, FPS, the active backend (CPU / UGen300) and connection status
-- **Resilient**: the WebSocket reconnects automatically, and the visuals keep running in idle mode while the backend is offline
+- **Resilient**: the WebSocket reconnects automatically, and the visuals keep running (holding their state) while the backend is offline. Gesture handling never depends on which panels are visible.
 
 ## Modes
 
@@ -88,7 +92,8 @@ flowchart LR
         EMA --> WS[(WebSocket server<br/>ws://localhost:8765<br/>~30 Hz JSON + preview JPEG)]
     end
     subgraph Browser["Browser (Three.js, no build step)"]
-        WS --> CTRL[Control state<br/>per-hand groups · breathing]
+        WS --> TRK[HandTracker<br/>stabilize · control · hold<br/>exit look-back]
+        TRK --> CTRL[Group followers<br/>linear, rate-limited · breathing · idle dimming]
         CTRL --> PHY[CPU physics<br/>spring-damper per particle<br/>target = lerp formed, scattered]
         TPL[Celestial templates<br/>+ palettes] --> PHY
         PHY --> GPU[Vertex shader<br/>curl noise · twinkle · Doppler]
@@ -105,12 +110,14 @@ For every particle, each frame:
 ```
 formed     F = template point (spun + tilted)    or   palm position + cloud offset  (Stardust)
 scattered  S = F + random_dir · random_dist       or   its own spot on the full screen (Stardust)
-o_i        = smoothstep(stagger(openness, seed_i))    # some grains react earlier
-target     = F + (S − F) · o_i
+o          = group scatter (follows the hand's openness linearly, rate-limited)
+target     = F + (S − F) · o
 accel      = ω_i² (target − p) − 2ζω_i (v − v_F)      # spring-damper, ω_i random per particle
 ```
 
-`v_F` (the formed shape's own velocity) is fed forward, so rotating disks are tracked exactly. Stardust leaves it out on purpose to create the dragging delay. The GPU adds divergence-free curl noise whose strength grows with the scatter amount.
+The group scatter `o` comes from the hand's openness through a short low-pass (`scatterSmoothing`) and a speed limit (`maxScatterSpeed` per second). Slow finger movements are followed at their own pace; fast ones are capped.
+
+`ω_i` is a random base frequency (1.6–4.2 rad/s) times `springStiffness`. `v_F` (the formed shape's own velocity) is fed forward, so rotating disks are tracked exactly. Stardust leaves it out on purpose to create the dragging delay. The GPU adds divergence-free curl noise whose strength grows with the scatter amount.
 
 ### Openness metric
 
@@ -140,7 +147,25 @@ Server → browser (≈30 Hz):
 
 `center` is the palm center, normalized to [0, 1] in the **mirrored** frame: moving your hand to your right increases `x`.
 
+`stale` is `true` while the server briefly repeats the last detection after a drop-out (anti-flicker). The browser ignores those frames when it measures hand motion.
+
 Browser → server (calibration): `{"type": "config", "fist_ratio": 0.95, "open_ratio": 1.8}`
+
+### Hand states (raise / use / lower)
+
+```mermaid
+stateDiagram-v2
+    [*] --> Stabilizing: hand detected
+    Stabilizing --> Stabilizing: moving faster than stableSpeed (timer restarts)
+    Stabilizing --> Controlling: steady for activationTime
+    Controlling --> Controlling: palm faster than fastSpeed → openness paused
+    Controlling --> Held: hand gone for LOST_TIMEOUT
+    Held --> Held: state kept (look-back to before a fast exit)
+    Held --> Controlling: a new hand becomes steady
+    Held --> Default: R / Reset, or switching mode
+```
+
+When a controlling hand disappears, the tracker looks back over its last `retroLookback` seconds of history (about 1 s is kept). If the palm was moving faster than `fastSpeed`, the held state is taken from just before that fast motion started, minus `RETRO_MARGIN`. Lowering your hand out of view therefore does not drag or change the particles.
 
 ### Project layout
 
@@ -163,7 +188,9 @@ particles/
 │       ├── palettes.js    # Natural / preset / custom palettes
 │       ├── sky.js         # parallax starfield + Milky Way
 │       ├── hands.js       # WebSocket client with auto-reconnect
-│       ├── debug.js       # calibration panel (localStorage)
+│       ├── handTracker.js # hand states: stabilize / control / hold, exit look-back
+│       ├── tuning.js      # tunable constants + defaults (localStorage)
+│       ├── debug.js       # debug panel: live states, sliders
 │       └── noise.js       # seeded RNG, simplex noise, fBm
 ├── docs/                  # README screenshots
 └── models/                # put *.hef files here (git-ignored)
@@ -201,6 +228,7 @@ python run.py                       # CPU / MediaPipe (default)
 | `python run.py` | MediaPipe on CPU, webcam 0 |
 | `python run.py --camera 1` | Use another webcam |
 | `python run.py --backend mock` | Synthetic hands, **no webcam needed** (good for rehearsals) |
+| `python run.py --backend mock --mock-scenario raise` | Mock script: raise a hand → open/close → drop it fast → long idle (`raise`, `sweep` or `all`) |
 | `python run.py --backend hailo --hef models/hand_landmark_lite.hef` | UGen300 prototype (see below) |
 | `python run.py --no-browser` | Don't open a browser |
 | `python run.py --smoothing 0.25` | Extra args are forwarded to `backend/server.py` (lower = smoother) |
@@ -220,7 +248,14 @@ python run.py                       # CPU / MediaPipe (default)
 | 🤏 Half open | In between: the scatter amount is continuous | In between |
 | ↔ Move your hand | The cloud follows your palm with a dragging delay (mirror view) | — |
 | 🙌 Two hands | Two clouds, one per hand | Average openness of both hands |
-| No hands | Dust fills the screen and floats | Formed object with its natural motion |
+| 👋 Hand leaves | The cloud stays where it was, at the same density | The object stays as scattered as it was |
+| ⬆ Raising a hand into view | Ignored until the hand is steady for 0.4 s | Same |
+| ⬇ Lowering a hand quickly | Ignored: the state just before the motion is kept | Same |
+| No hands at start | Dust fills the screen and floats | Formed object with its natural motion |
+
+Press `R` (or **Reset**) to return to the current mode's default shape: dust spread over the screen, or the fully formed object. Switching modes (`1`–`6`) morphs into the new mode's default shape as before.
+
+**Idle dimming**: when no hand is seen, or no noticeable gesture happens, for 60 s, the particles slowly dim (over 45 s) to 18% while a few bright stars keep twinkling. A hand, a key press or the mouse brings everything back within 1.5 s.
 
 **Breathing mode** (`B`): inhale 4 s → the particles scatter; hold 4 s; exhale 6 s → they gather again (in Stardust, around your hand or the screen center). A faint *Inhale / Hold / Exhale* cue and countdown appear in the center.
 
@@ -231,9 +266,10 @@ python run.py                       # CPU / MediaPipe (default)
 | `1` – `6` | Stardust · Spiral Galaxy · Saturn · Nebula · Black Hole · Star Cluster |
 | `T` | Next color theme |
 | `B` | Breathing guide on/off |
+| `R` | Reset to the current mode's default shape (smooth) |
 | `F` | Fullscreen |
-| `H` | Hide / show all panels (immersive mode) |
-| `D` | Gesture calibration panel |
+| `H` | Hide / show all panels (immersive mode); a small dot bottom-right still shows the hand state |
+| `D` | Debug panel: hand states, calibration and tuning sliders |
 
 ### Calibrating gestures
 
@@ -242,7 +278,28 @@ Press `D` and watch the **ratio** of each hand:
 1. Make a tight fist and set `FIST_RATIO` slightly **above** the ratio shown.
 2. Spread your hand fully and set `OPEN_RATIO` slightly **below** the ratio shown.
 
-Changes apply immediately on the server and are stored in the browser's `localStorage`, then re-applied on the next connection. *Reset to defaults* restores 1.00 / 1.75.
+Changes apply immediately on the server and are stored in the browser's `localStorage`, then re-applied on the next connection.
+
+### Tuning constants
+
+All constants below live in `frontend/js/tuning.js` and have sliders in the debug panel (`D`). Changes are saved in `localStorage`; *Reset all to defaults* restores them.
+
+| Constant | Default | Meaning |
+|---|---|---|
+| `springStiffness` | 0.55 | Multiplier on the particle spring frequency (1.0 = the earlier, faster feel) |
+| `springDamping` | 0.85 | Spring damping ratio ζ |
+| `followDelay` | 0.12 s | Time constant for the dust cloud to follow the palm |
+| `maxScatterSpeed` | 0.7 / s | Fastest change of the scatter amount (full range = 1) |
+| `scatterSmoothing` | 0.15 s | Low-pass on openness before the speed limit |
+| `activationTime` | 0.4 s | A new hand must stay steady this long before it takes control |
+| `stableSpeed` | 0.35 frame/s | Palm speed below which a new hand counts as steady |
+| `fastSpeed` | 1.0 frame/s | Palm speed above which openness updates pause |
+| `retroLookback` | 0.8 s | Window before a hand disappears that is checked for a fast exit |
+| `idleSeconds` | 60 s | Idle time before dimming starts |
+| `dimDuration` | 45 s | Duration of the fade |
+| `dimLevel` | 0.18 | Brightness while idle (background stars are not dimmed) |
+
+Fixed constants: `HISTORY_SECONDS` 1.2 s, `LOST_TIMEOUT` 0.2 s, `RETRO_MARGIN` 0.15 s, `WAKE_SECONDS` 1.5 s, `BRIGHT_STAR_FRACTION` 0.04. Speeds are in frame widths or heights per second (normalized camera coordinates).
 
 ## UGen300 deployment (Hailo-10H)
 
@@ -286,6 +343,7 @@ Everything downstream of `process()` is backend-agnostic: feature extraction, sm
 - The celestial objects are artistic, physically *inspired* models (log-spiral arms, Plummer profile, Keplerian disks, a lensing approximation), not physical simulations.
 - The frontend loads Three.js from a CDN. For fully offline kiosks, vendor `three.module.js` locally and update the import map.
 - The camera preview is sent as base64 JPEG over a local WebSocket. That is fine on localhost but not designed for remote or multi-user streaming.
+- Ignoring raise/lower motions is best effort: it relies on palm speed. A hand that rises or drops slowly can still move the particles, and a very still hand entering the frame takes control after 0.4 s. Tune `stableSpeed`, `fastSpeed` and `activationTime` for your setup.
 - This is not a medical device. The breathing guide is for relaxation only.
 
 ## License

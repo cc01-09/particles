@@ -46,7 +46,7 @@ def create_backend(args: argparse.Namespace):
         return HailoHandBackend(hef_path=args.hef)
     if args.backend == "mock":
         from backend_mock import MockBackend
-        return MockBackend()
+        return MockBackend(scenario=args.mock_scenario)
     raise ValueError(f"unknown backend: {args.backend}")
 
 
@@ -206,6 +206,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--backend", choices=["cpu", "hailo", "mock"], default="cpu",
                    help="cpu = MediaPipe (demo), hailo = UGen300 prototype, mock = synthetic hands")
     p.add_argument("--hef", default="models/hand_landmark_lite.hef", help="HEF path for --backend hailo")
+    p.add_argument("--mock-scenario", choices=["all", "raise", "sweep"], default="all",
+                   help="synthetic hand script for --backend mock (see backend_mock.py)")
     p.add_argument("--camera", type=int, default=0, help="webcam index")
     p.add_argument("--width", type=int, default=640)
     p.add_argument("--height", type=int, default=480)

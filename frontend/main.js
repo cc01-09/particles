@@ -12,6 +12,10 @@
  * The camera and the particle sizes never change with gestures: a gesture
  * moves each particle individually.
  *
+ * Hand input is handled by HandTracker as messages arrive — independent of
+ * rendering and of which UI panels are visible. All timing uses one clock:
+ * performance.now().
+ *
  * No build step: Three.js is loaded from a CDN through the import map.
  * URL options:  ?ws=ws://host:8765   ?n=32000 (fixed count, disables auto-scaling)
  */
@@ -26,6 +30,8 @@ import { NATURAL, THEMES, cssGradient, paletteFromBase, samplePalette, toColors 
 import { createSky } from './js/sky.js';
 import { HandSocket } from './js/hands.js';
 import { DebugPanel, loadThresholds } from './js/debug.js';
+import { HandTracker } from './js/handTracker.js';
+import { BRIGHT_STAR_FRACTION, WAKE_SECONDS, loadTuning } from './js/tuning.js';
 import { mulberry32, unitVector } from './js/noise.js';
 
 // ===========================================================================
@@ -40,7 +46,9 @@ const WS_URL = params.get('ws') || `ws://${location.hostname || 'localhost'}:876
 const CAMERA_Z = 6.5;
 const FOV = 55;
 const TAN_HALF_FOV = Math.tan(THREE.MathUtils.degToRad(FOV / 2));
-const DAMPING = 0.78;            // spring damping ratio (slightly under-damped)
+// Live-tunable constants (motion, hand stability, idle dimming): see js/tuning.js
+const tuning = loadTuning();
+const now = () => performance.now() / 1000;   // the single time base for everything
 
 const BREATH_PHASES = [          // 4-4-6 breathing pattern (seconds)
   { name: 'Inhale', duration: 4 },
@@ -105,10 +113,10 @@ const sizes = new Float32Array(N);
 const targetSizes = new Float32Array(N);
 const doppler = new Float32Array(N);
 const targetDoppler = new Float32Array(N);
-const seeds = new Float32Array(N);            // 0..1, stagger + twinkle phase
+const seeds = new Float32Array(N);            // 0..1, twinkle phase + bright-star pick
 const mags = new Float32Array(N);             // 0..1 power law: most faint, few bright
 const groups = new Float32Array(N);           // 0 / 1: which hand a stardust grain follows
-const stiffness = new Float32Array(N);        // spring natural frequency (rad/s)
+const stiffness = new Float32Array(N);        // base spring frequency (rad/s), x tuning.springStiffness
 const scatterDir = new Float32Array(N * 3);   // per-particle random scatter direction
 const scatterDist = new Float32Array(N);
 
@@ -205,9 +213,12 @@ const material = new THREE.ShaderMaterial({
     uScatterNoise: { value: 0.5 },   // extra curl-noise drift while scattered
     uDoppler: { value: 0 },
     uOpacity: { value: 0.85 },
+    uDim: { value: 1 },              // idle dimming (1 = normal brightness)
+    uIdle: { value: 0 },             // 0..1 dimming progress (boosts the few bright stars)
+    uStarFraction: { value: BRIGHT_STAR_FRACTION },
   },
   vertexShader: /* glsl */ `
-    uniform float uTime, uSize, uPixelRatio, uFlow, uScatterNoise, uDoppler;
+    uniform float uTime, uSize, uPixelRatio, uFlow, uScatterNoise, uDoppler, uDim, uIdle, uStarFraction;
     uniform vec2 uScatter;
     attribute vec3 aColor;
     attribute float aSize, aSeed, aGroup, aDoppler;
@@ -225,11 +236,16 @@ const material = new THREE.ShaderMaterial({
       gl_Position = projectionMatrix * mv;
       gl_PointSize = uSize * aSize * uPixelRatio / -mv.z;
 
+      // A few percent of particles act as "bright stars": they stay lit and
+      // twinkle more while everything else dims during idle time.
+      float star = step(fract(aSeed * 97.31), uStarFraction);
+      float dim = mix(uDim, 1.0 + 1.6 * uIdle, star);
+
       // Subtle twinkle, different rate and phase per particle.
-      float twinkle = 1.0 + 0.14 * sin(uTime * (0.7 + aSeed * 2.6) + aSeed * 61.0);
+      float twinkle = 1.0 + (0.14 + 0.3 * star * uIdle) * sin(uTime * (0.7 + aSeed * 2.6) + aSeed * 61.0);
       // Relativistic beaming: material moving toward us (right side) is brighter.
       float beam = 1.0 + uDoppler * aDoppler * 0.8 * clamp(p.x / max(length(p.xz), 0.3), -1.0, 1.0);
-      vColor = aColor * twinkle * max(beam, 0.2);
+      vColor = aColor * twinkle * max(beam, 0.2) * dim;
     }
   `,
   fragmentShader: /* glsl */ `
@@ -261,25 +277,32 @@ const state = {
   breathing: false,
   breathStart: 0,
   transitionUntil: 0,
+  lastUserActivity: 0,   // last key / pointer input (counts as activity for idle dimming)
   resetFeedForward: true,
 };
 
 const input = {
   connected: false,
   lastMessage: 0,
-  hands: [],            // [{label, openness, ratio, center:[x,y]}] (x mirrored: selfie view)
+  hands: [],            // raw [{label, openness, ratio, center:[x,y]}] (x mirrored: selfie view)
   thresholds: null,     // as reported by the server
 };
 
-// Smoothed control signals.
+// Turns detections into stable per-group targets (stabilize / control / hold).
+const tracker = new HandTracker(tuning);
+
+/** Default scatter of the current mode: Stardust fills the screen, objects are formed. */
+const defaultOpen = () => (state.template === 'stardust' ? 1 : 0);
+
+// Smoothed control signals (what the particles actually follow).
 const ctrl = {
-  presence: 0,          // 0 = no hands, 1 = hands present
   breathWeight: 0,      // fades the breathing influence in/out
-  scatter: 0,           // template modes: 0 = formed, 1 = scattered
-  groups: [             // Stardust: one dust cloud per hand
-    { x: 0, y: 0, open: 1 },
-    { x: 0, y: 0, open: 1 },
+  scatter: 0,           // template modes: mean of the two groups (0 = formed, 1 = scattered)
+  groups: [             // one particle group per hand
+    { x: 0, y: 0, open: 1, smooth: 1 },
+    { x: 0, y: 0, open: 1, smooth: 1 },
   ],
+  brightness: 1,        // idle dimming level currently applied
   sway: { x: 0, y: 0 },
 };
 
@@ -326,9 +349,10 @@ const ui = {
   breath: document.getElementById('breath'),
   breathWord: document.getElementById('breath-word'),
   breathCount: document.getElementById('breath-count'),
+  handDot: document.getElementById('hand-dot'),
 };
 
-const debugPanel = new DebugPanel(document.getElementById('debug'), (thresholds) => {
+const debugPanel = new DebugPanel(document.getElementById('debug'), tuning, (thresholds) => {
   socket.send({ type: 'config', ...thresholds });
 });
 
@@ -342,10 +366,11 @@ const socket = new HandSocket(WS_URL, {
     const saved = loadThresholds();
     if (saved) socket.send({ type: 'config', ...saved });
   },
-  onClose() {
+  onClose(wasConnected) {
     input.connected = false;
     input.hands = [];
     input.thresholds = null;
+    if (wasConnected) tracker.dropAll(now());   // controlling hands become held
     ui.cam.style.display = 'none';
     ui.camPlaceholder.style.display = '';
     ui.camPlaceholder.textContent = 'Inference server offline';
@@ -356,10 +381,12 @@ const socket = new HandSocket(WS_URL, {
   onMessage(msg) {
     if (msg.backend) ui.backend.textContent = BACKEND_LABELS[msg.backend] || msg.backend_label || msg.backend;
     if (msg.type !== 'hands') return;
+    // Gesture state is updated here, on arrival, before any UI work.
     input.connected = true;
-    input.lastMessage = performance.now() / 1000;
+    input.lastMessage = now();
     input.hands = msg.hands || [];
     input.thresholds = msg.thresholds || null;
+    tracker.ingest(input.hands, input.lastMessage, msg.stale === true);
 
     if (msg.image) {
       ui.cam.src = msg.image;
@@ -418,10 +445,7 @@ function updateBreathUI(b) {
 const lerpRate = (rate, dt) => 1 - Math.pow(1 - rate, dt * 60);  // frame-rate independent
 
 function updateControls(t, dt) {
-  const live = input.connected && t - input.lastMessage < 1.5;
-  // Sort by screen x so group 0 = left-most hand, group 1 = right-most hand.
-  const hands = live ? [...input.hands].sort((a, b) => a.center[0] - b.center[0]) : [];
-  ctrl.presence += ((hands.length ? 1 : 0) - ctrl.presence) * lerpRate(0.05, dt);
+  tracker.update(t);
 
   // Breathing: inhale -> scatter, exhale -> gather.
   ctrl.breathWeight += ((state.breathing ? 1 : 0) - ctrl.breathWeight) * lerpRate(0.03, dt);
@@ -433,52 +457,59 @@ function updateControls(t, dt) {
   }
   const bw = ctrl.breathWeight;
 
-  // --- Stardust: each group follows one hand ---------------------------------
+  // --- Groups follow their targets (a controlling hand, or the held state) ---
+  // Openness maps linearly to scatter. The follower is rate-limited, so the
+  // particles move as fast as the fingers do, up to maxScatterSpeed.
+  const smoothF = 1 - Math.exp(-dt / tuning.scatterSmoothing);
+  const maxStep = tuning.maxScatterSpeed * dt;
+  const followF = 1 - Math.exp(-dt / tuning.followDelay);
   ctrl.groups.forEach((g, idx) => {
-    const hand = hands.length === 2 ? hands[idx] : hands[0];
-    let targetOpen = 1;                         // no hand: dust fills the screen
-    if (hand) {
-      const [x, y] = handToWorld(hand.center);
-      const f = lerpRate(0.25, dt);             // light smoothing; springs add the drag
-      g.x += (x - g.x) * f;
-      g.y += (y - g.y) * f;
-      targetOpen = hand.openness;
-    } else if (bw > 0.01) {
-      const f = lerpRate(0.03, dt);             // breathing without hands: gather at center
-      g.x -= g.x * f;
-      g.y -= g.y * f;
-    }
-    targetOpen = THREE.MathUtils.lerp(targetOpen, 0.08 + 0.82 * breath, bw);
-    g.open += (targetOpen - g.open) * lerpRate(0.08, dt);
+    const target = tracker.groups[idx].target;
+    const open = THREE.MathUtils.lerp(target.open, 0.08 + 0.82 * breath, bw);
+    g.smooth += (open - g.smooth) * smoothF;
+    g.open += THREE.MathUtils.clamp(g.smooth - g.open, -maxStep, maxStep);
+    const [x, y] = handToWorld([target.x, target.y]);
+    g.x += (x - g.x) * followF;
+    g.y += (y - g.y) * followF;
   });
-
-  // --- Celestial templates: hands scatter / re-form the object ---------------
-  let scatterTarget = hands.length ? hands.reduce((s, h) => s + h.openness, 0) / hands.length : 0;
-  scatterTarget = THREE.MathUtils.lerp(scatterTarget, 0.35 * breath, bw);
-  ctrl.scatter += (scatterTarget - ctrl.scatter) * lerpRate(0.08, dt);
-
-  // Background parallax: slow drift plus a hint of the hands' average position.
-  let hx = 0;
-  let hy = 0;
-  if (hands.length) {
-    hands.forEach((h) => { hx += h.center[0] - 0.5; hy += h.center[1] - 0.5; });
-    hx /= hands.length; hy /= hands.length;
+  ctrl.scatter = (ctrl.groups[0].open + ctrl.groups[1].open) / 2;
+  if (state.template !== 'stardust') {
+    // Objects: inhale scatters gently (35%) instead of fully.
+    ctrl.scatter = THREE.MathUtils.lerp(ctrl.scatter, 0.35 * breath, bw);
   }
-  const sx = Math.sin(t * 0.05) * 0.25 + hx * 0.6 * ctrl.presence;
-  const sy = Math.cos(t * 0.037) * 0.15 - hy * 0.4 * ctrl.presence;
+
+
+  // Background parallax: slow drift plus a hint of the groups' position.
+  const hx = (tracker.groups[0].target.x + tracker.groups[1].target.x) / 2 - 0.5;
+  const hy = (tracker.groups[0].target.y + tracker.groups[1].target.y) / 2 - 0.5;
+  const sx = Math.sin(t * 0.05) * 0.25 + hx * 0.6;
+  const sy = Math.cos(t * 0.037) * 0.15 - hy * 0.4;
   ctrl.sway.x += (sx - ctrl.sway.x) * lerpRate(0.02, dt);
   ctrl.sway.y += (sy - ctrl.sway.y) * lerpRate(0.02, dt);
+}
+
+/**
+ * Idle dimming: after `idleSeconds` without a hand or without a noticeable
+ * gesture change, fade to `dimLevel` over `dimDuration`. Any activity
+ * (a hand appearing, a gesture change, a key or pointer) wakes it up
+ * within WAKE_SECONDS. Background stars are never dimmed.
+ */
+function updateDimming(t, dt) {
+  const idleFor = t - Math.max(tracker.lastActivity, state.lastUserActivity);
+  const p = THREE.MathUtils.clamp((idleFor - tuning.idleSeconds) / tuning.dimDuration, 0, 1);
+  const level = 1 - (1 - tuning.dimLevel) * (p * p * (3 - 2 * p));
+  if (level > ctrl.brightness) {
+    ctrl.brightness += (level - ctrl.brightness) * (1 - Math.exp(-dt / (WAKE_SECONDS / 3)));
+  } else {
+    ctrl.brightness = level;     // the fade itself is already slow
+  }
+  material.uniforms.uDim.value = ctrl.brightness;
+  material.uniforms.uIdle.value = THREE.MathUtils.clamp((1 - ctrl.brightness) / (1 - tuning.dimLevel + 1e-6), 0, 1);
 }
 
 // ===========================================================================
 // Particle physics (per frame, CPU)
 // ===========================================================================
-/** Per-particle staggered response: some grains react earlier than others. */
-function stagger(o, seed) {
-  const x = Math.min(Math.max((o - seed * 0.3) / 0.7, 0), 1);
-  return x * x * (3 - 2 * x);
-}
-
 function simulate(t, dt) {
   const tpl = TEMPLATES[state.template];
   const d = tpl.data;
@@ -489,6 +520,8 @@ function simulate(t, dt) {
   const resetFF = state.resetFeedForward;
   state.resetFeedForward = false;
   const invDt = 1 / dt;
+  const stiffScale = tuning.springStiffness;
+  const zeta = tuning.springDamping;
 
   for (let i = 0; i < activeCount; i++) {
     const i3 = i * 3;
@@ -508,7 +541,7 @@ function simulate(t, dt) {
       sx = (d.screen[i3] + 0.05 * Math.sin(t * 0.07 + ph)) * halfH * aspect;
       sy = (d.screen[i3 + 1] + 0.05 * Math.cos(t * 0.06 + ph)) * halfH;
       sz = z;
-      o = stagger(g.open, seeds[i]);
+      o = g.open;         // linear: half-open hand = half scattered
     } else {
       // Formed = template point, spun around its local axis, then tilted.
       let lx = d.pos[i3];
@@ -534,7 +567,7 @@ function simulate(t, dt) {
       sx = fx + scatterDir[i3] * dist;
       sy = fy + scatterDir[i3 + 1] * dist;
       sz = fz + scatterDir[i3 + 2] * dist;
-      o = stagger(ctrl.scatter, seeds[i]);
+      o = ctrl.scatter;
     }
 
     const tx = fx + (sx - fx) * o;
@@ -555,9 +588,10 @@ function simulate(t, dt) {
     prevFormed[i3 + 2] = fz;
 
     // Spring-damper: a = w^2 (target - p) - 2 zeta w (v - v_target)
-    const w = stiffness[i];
+    // (per-particle frequencies differ, so grains arrive at different times)
+    const w = stiffness[i] * stiffScale;
     const k = w * w;
-    const c = 2 * DAMPING * w;
+    const c = 2 * zeta * w;
     let vx = velocities[i3];
     let vy = velocities[i3 + 1];
     let vz = velocities[i3 + 2];
@@ -627,22 +661,34 @@ function setTemplate(key) {
   if (key !== state.template) {
     state.template = key;
     state.resetFeedForward = true;
-    updateTargets(clock.getElapsedTime());
+    updateTargets(now());
+    // Morph into the new mode's default shape. Groups driven by a hand stay
+    // under hand control; held groups take the new default immediately
+    // (the springs make the morph itself smooth).
+    tracker.resetGroups(defaultOpen());
+    tracker.groups.forEach((tg, i) => {
+      if (tg.trackId === null) ctrl.groups[i].open = ctrl.groups[i].smooth = defaultOpen();
+    });
   }
   templateButtons.forEach((b) => b.classList.toggle('active', b.dataset.template === key));
+}
+
+/** R / Reset: smoothly return held particles to this mode's default shape. */
+function resetShape() {
+  tracker.resetGroups(defaultOpen());
 }
 
 function setTheme(key) {
   state.theme = key;
   themeButtons.forEach((b) => b.classList.toggle('active', b.dataset.theme === key));
   customTheme.classList.toggle('active', key === 'custom');
-  updateTargets(clock.getElapsedTime());
+  updateTargets(now());
 }
 
 function setBreathing(on) {
   state.breathing = on;
   if (on) {
-    state.breathStart = clock.getElapsedTime();
+    state.breathStart = now();
     lastBreathLabel = '';
   }
   ui.breath.classList.toggle('on', on);
@@ -668,13 +714,21 @@ document.getElementById('color').addEventListener('input', (e) => {
 document.getElementById('breath-toggle').addEventListener('click', () => setBreathing(!state.breathing));
 document.getElementById('fullscreen').addEventListener('click', toggleFullscreen);
 document.getElementById('collapse').addEventListener('click', () => setCollapsed(true));
+document.getElementById('reset').addEventListener('click', resetShape);
 document.getElementById('expand').addEventListener('click', () => setCollapsed(false));
 document.addEventListener('fullscreenchange', () => {
   document.getElementById('fullscreen').textContent = document.fullscreenElement ? 'Exit' : 'Fullscreen';
 });
 
+// Any key or pointer input counts as activity (wakes the display from idle dimming).
+const markUserActivity = () => { state.lastUserActivity = now(); };
+window.addEventListener('pointerdown', markUserActivity);
+window.addEventListener('pointermove', markUserActivity, { passive: true });
+
 window.addEventListener('keydown', (e) => {
-  if (e.target instanceof HTMLInputElement && e.target.type !== 'range') return;
+  markUserActivity();
+  // Ignore shortcuts only while typing into a text field (sliders / color are fine).
+  if (e.target instanceof HTMLInputElement && !['range', 'color', 'checkbox'].includes(e.target.type)) return;
   if (e.metaKey || e.ctrlKey || e.altKey) return;
   const key = e.key.toLowerCase();
   if (key >= '1' && key <= String(TEMPLATE_DEFS.length)) setTemplate(TEMPLATE_DEFS[Number(key) - 1].key);
@@ -685,6 +739,7 @@ window.addEventListener('keydown', (e) => {
   else if (key === 'f') toggleFullscreen();
   else if (key === 'h') setCollapsed(!document.body.classList.contains('collapsed'));
   else if (key === 'd') debugPanel.toggle();
+  else if (key === 'r') resetShape();
 });
 
 function onResize() {
@@ -731,14 +786,17 @@ function adaptQuality(dt) {
 // ===========================================================================
 // Main loop
 // ===========================================================================
-const clock = new THREE.Clock();
 let debugTimer = 0;
+let lastFrame = now();
 
 function animate() {
-  const dt = Math.min(clock.getDelta(), 0.05);   // clamp after tab switches
-  const t = clock.getElapsedTime();
+  const t = now();
+  const rawDt = t - lastFrame;
+  const dt = Math.min(rawDt, 0.05);   // physics step, clamped after tab switches / slow frames
+  lastFrame = t;
 
   updateControls(t, dt);
+  updateDimming(t, Math.min(rawDt, 0.5));   // wall-clock timing (fade / 1.5 s wake-up)
   simulate(t, Math.max(dt, 1e-3));
   material.uniforms.uTime.value = t;
   sky.update(t, ctrl.sway);
@@ -747,12 +805,16 @@ function animate() {
   adaptQuality(dt);
   if ((debugTimer += dt) > 0.2) {
     debugTimer = 0;
+    const idleFor = t - Math.max(tracker.lastActivity, state.lastUserActivity);
     debugPanel.update({
-      hands: input.hands,
+      tracker,
       serverThresholds: input.thresholds,
       stats: `particles ${activeCount.toLocaleString()} / ${N.toLocaleString()} · ${Math.round(perf.fps)} fps · `
-        + `dust ${ctrl.groups[0].open.toFixed(2)} / ${ctrl.groups[1].open.toFixed(2)} · object scatter ${ctrl.scatter.toFixed(2)}`,
+        + `scatter A ${ctrl.groups[0].open.toFixed(2)} / B ${ctrl.groups[1].open.toFixed(2)} · `
+        + `idle ${Math.floor(idleFor)} s · brightness ${(ctrl.brightness * 100).toFixed(0)}%`,
     });
+    // Tiny hand indicator, visible even with every panel hidden.
+    ui.handDot.className = `dot ${tracker.anyControlling ? 'ok' : tracker.anyStabilizing ? 'warn' : ''}`;
   }
   requestAnimationFrame(animate);
 }
@@ -778,7 +840,7 @@ requestAnimationFrame(animate);
 
 // Debug / automation handle (used by the headless tests).
 window.particles = {
-  state, input, ctrl, setTemplate, setTheme, setBreathing, setCollapsed,
+  state, input, ctrl, tracker, tuning, setTemplate, setTheme, setBreathing, setCollapsed, resetShape,
   get activeCount() { return activeCount; },
   /** Mean screen-space x/y (NDC, -1..1) of the particles in a hand group. */
   centroid(group) {
